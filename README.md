@@ -14,17 +14,17 @@ To test your implementation, run `go test -v` inside of the `client_test` direct
 
 Fill in this section with the student IDs of all the members in your project group.
 
-Partner 1 Name:
+Partner 1 Name: JungMin Shin
 
-Partner 1 SID:
+Partner 1 SID: 3040516768
 
-Partner 1 Email:
+Partner 1 Email: jacob_shin@berkeley.edu
 
-Partner 2 Name (if applicable):
+Partner 2 Name (if applicable): Mauricio Yeverino-Penunuri
 
-Partner 2 SID (if applicable):
+Partner 2 SID (if applicable): 3040541338
 
-Partner 2 Email (if applicable):
+Partner 2 Email (if applicable): mauricio_yeverino@berkeley.edu
 
 Also add a link to this repo below (should start with https://github.com/cs161-students/).
 
