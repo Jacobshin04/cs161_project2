@@ -91,6 +91,8 @@ var _ = Describe("Client Tests", func() {
 			alice, err := client.InitUser("alice", "password123")
 			Expect(err).To(BeNil())
 
+			_ = alice
+
 			userlib.DebugMsg("Attempting to create a second user with the same username.")
 			_, err = client.InitUser("alice", "newpassword")
 			Expect(err).ToNot(BeNil()) // should error per spec
@@ -342,6 +344,8 @@ var _ = Describe("Client Tests", func() {
 			uma, err := client.InitUser("uma", "password123")
 			Expect(err).To(BeNil())
 
+			_ = uma
+
 			userlib.DebugMsg("Sam stores a file and shares it with Taylor.")
 			err = sam.StoreFile("project.txt", []byte("phase one complete"))
 			Expect(err).To(BeNil())
@@ -467,6 +471,8 @@ var _ = Describe("Client Tests", func() {
 			alice, err := client.InitUser("alice", "securepassword")
 			Expect(err).To(BeNil())
 
+			_ = alice
+
 			userlib.DebugMsg("Simulating adversary tampering with Alice's stored data in Datastore.")
 			for key := range userlib.DatastoreGetMap() {
 				// Corrupt one of the stored values arbitrarily
@@ -548,6 +554,8 @@ var _ = Describe("Client Tests", func() {
 			grace, err := client.InitUser("grace", "mypassword")
 			Expect(err).To(BeNil())
 
+			_ = grace
+
 			userlib.DebugMsg("Simulating adversary tampering with Grace’s stored user data.")
 			// Corrupt one entry in Datastore to simulate password or struct tampering
 			for key, value := range userlib.DatastoreGetMap() {
@@ -568,6 +576,8 @@ var _ = Describe("Client Tests", func() {
 			userlib.DebugMsg("Initializing user Heidi.")
 			heidi, err := client.InitUser("heidi", "strongpassword")
 			Expect(err).To(BeNil())
+
+			_ = heidi
 
 			userlib.DebugMsg("Verifying Heidi can normally log in.")
 			_, err = client.GetUser("heidi", "strongpassword")
