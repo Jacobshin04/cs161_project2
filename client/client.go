@@ -136,22 +136,29 @@ type UserObject struct {
 
 // Helper Functions
 
-// symmetric encryption and then MAC
 func Enc_then_mac_hash(K []byte, IV []byte, message []byte) (blob EncryptedBlob, err error) {
 	// IV length check
 	if len(IV) != 16 {
 		return EncryptedBlob{}, errors.New("invalid IV length")
 	}
 
-	KDF_output, err := userlib.HashKDF(K, []byte("key one"))
+	// Derive encryption and MAC keys from K
+	KDFOutput, err := userlib.HashKDF(K, []byte("key one"))
 	if err != nil {
 		return EncryptedBlob{}, err
 	}
-	K1 := KDF_output[:16]
-	K2 := KDF_output[16:32]
+	if len(KDFOutput) < 32 {
+		return EncryptedBlob{}, errors.New("insufficient KDF output length")
+	}
+	K1 := KDFOutput[:16]
+	K2 := KDFOutput[16:32]
 
+	// Encrypt
 	ciphertext := userlib.SymEnc(K1, IV, message)
-	mac, err := userlib.HMACEval(K2, ciphertext)
+
+	// MAC over IV || ciphertext
+	macInput := append(IV, ciphertext...)
+	mac, err := userlib.HMACEval(K2, macInput)
 	if err != nil {
 		return EncryptedBlob{}, err
 	}
@@ -164,16 +171,8 @@ func Enc_then_mac_hash(K []byte, IV []byte, message []byte) (blob EncryptedBlob,
 	return blob, nil
 }
 
-func slow_hash(pw []byte, salt []byte) (encryptedMessage []byte, mac []byte, e error) {
-	// Salt length check
-	if len(salt) != 16 {
-		return nil, nil, errors.New("invalid Salt length")
-	}
-	userlib.Argon2Key(pw, salt, 16)
-}
-
 func Mac_hash_then_decrypt(K []byte, blob EncryptedBlob) (plaintext []byte, err error) {
-	// Check IV length
+	// Basic checks
 	if len(blob.IV) != 16 {
 		return nil, errors.New("invalid IV length")
 	}
@@ -182,15 +181,19 @@ func Mac_hash_then_decrypt(K []byte, blob EncryptedBlob) (plaintext []byte, err 
 	}
 
 	// Derive encryption and MAC keys from K
-	KDF_output, err := userlib.HashKDF(K, []byte("key one"))
+	KDFOutput, err := userlib.HashKDF(K, []byte("key one"))
 	if err != nil {
 		return nil, err
 	}
-	K1 := KDF_output[:16]
-	K2 := KDF_output[16:32]
+	if len(KDFOutput) < 32 {
+		return nil, errors.New("insufficient KDF output length")
+	}
+	K1 := KDFOutput[:16]
+	K2 := KDFOutput[16:32]
 
-	// Check MAC
-	expectedMac, err := userlib.HMACEval(K2, blob.Ciphertext)
+	// Verify MAC over IV || ciphertext
+	macInput := append(blob.IV, blob.Ciphertext...)
+	expectedMac, err := userlib.HMACEval(K2, macInput)
 	if err != nil {
 		return nil, err
 	}
@@ -198,147 +201,217 @@ func Mac_hash_then_decrypt(K []byte, blob EncryptedBlob) (plaintext []byte, err 
 		return nil, errors.New("MAC mismatch")
 	}
 
+	// Decrypt
 	plaintext = userlib.SymDec(K1, blob.Ciphertext)
 	return plaintext, nil
 }
 
-// NOTE: The following methods have toy (insecure!) implementations.
-
-func InitUser(username string, password string) (userdataptr *User, err error) {
-	// Check length of  username is non zero
-	if len(username) == 0 {
-		return nil, errors.New("Lenght of username cannot be 0")
+func slow_hash(pw []byte, salt []byte) (encryptedMessage []byte, e error) {
+	// Salt length check
+	if len(salt) != 16 {
+		return nil, errors.New("invalid Salt length")
 	}
-	// Username = uuid.FromBytes(hash(username)[0:16]) and Hash the PW = SK.
-	var user, e = uuid.FromBytes(userlib.Hash([]byte(username))[:16])
-	if e != nil {
-		return nil, errors.New("username failed to create")
-	}
-	// TO DO: Remove. Just for testing purposes that user is length 16
-	if len(user) != 16 {
-		return nil, errors.New("Length of user is not 16")
-	}
-	// Check if the username exists in Datastore
-	var value, ok = userlib.DatastoreGet(user)
-	if ok {
-		return nil, fmt.Errorf("username %q already exists", username)
-	}
-
-	// Generate SaltUUID, PrivateKeyUUID, and IV with UUID.new.
-	var SaltUUID = uuid.New()
-	var PrivateKeyUUID = uuid.New()
-	var UserObjectIV = uuid.New()
-
-	//In datastore Username maps to IV || Encrypt_then_mac_hash(SK1, IV, {SaltUUID, PrivateKeyUUID})
-
-	userObject := UserObject{
-		SaltUUID:       SaltUUID,
-		PrivateKeyUUID: PrivateKeyUUID,
-	}
-
-	var userObjectBytes, err_userObjectBytes = json.Marshal(userObject)
-	if err_userObjectBytes != nil {
-		return nil, errors.New("Error while marshal user object")
-	}
-
-	// Generate keys from password
-	var K = userlib.Hash([]byte(password))
-	KDF_output, err := userlib.HashKDF(K, []byte("key one"))
-	if err != nil {
-		return nil, errors.New("Key generstion failed")
-	}
-	K1 := KDF_output[:16]
-	K2 := KDF_output[16:32]
-
-	// Encrypt user object (bytes)
-	var enc_blob, err = Enc_then_mac_hash(K1, UserObjectIV[:], userObjectBytes)
-
+	return userlib.Argon2Key(pw, salt, 16), nil
 }
 
+func InitUser(username string, password string) (userdataptr *User, err error) {
+	// Check length username nonzero
+	if len(username) == 0 {
+		return nil, errors.New("InitUser: username cannot be empty")
+	}
+
+	// Map username to determinitstic uuid
+	userUUID, e := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+	if e != nil {
+		return nil, errors.New("InitUser: failed to derive user UUID from username")
+	}
+
+	// Make sure username doesn't exist yet
+	if _, exists := userlib.DatastoreGet(userUUID); exists {
+		return nil, fmt.Errorf("InitUser: username %q already exists", username)
+	}
+
+	// generate UUIDs for location of salt, privateKey and userObject
+	saltUUID := uuid.New()
+	privateKeyUUID := uuid.New()
+	userObjectIV := uuid.New()
+
+	// userObject points to salt and privateKey pointers
+	userObject := UserObject{
+		SaltUUID:       saltUUID,
+		PrivateKeyUUID: privateKeyUUID,
+	}
+
+	userObjectBytes, err := json.Marshal(userObject)
+	if err != nil {
+		return nil, errors.New("InitUser: error while Marshal userObject")
+	}
+
+	// derive key K from password. HashKDF K and split into k1 and k2
+	K := userlib.Hash([]byte(password))
+
+	KDFOutput, err := userlib.HashKDF(K[:16], []byte("key one"))
+	if err != nil {
+		return nil, errors.New("InitUser: key derivation failed")
+	}
+	if len(KDFOutput) < 32 {
+		return nil, errors.New("InitUser: insufficient KDF output length")
+	}
+	K1 := KDFOutput[:16]   // root key for userObject blob
+	K2 := KDFOutput[16:32] // root key for salt blob
+
+	// encrypt userObject with K1 and store under userUUID
+	encUserBlob, err := Enc_then_mac_hash(K1, userObjectIV[:], userObjectBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	encUserBytes, err := json.Marshal(encUserBlob)
+	if err != nil {
+		return nil, errors.New("InitUser: error while marshaling encrypted user object")
+	}
+
+	userlib.DatastoreSet(userUUID, encUserBytes)
+
+	// generate salt, encrypt it with K2, and store under saltUUID
+	salt := uuid.New()
+	saltIV := uuid.New() // IV for salt
+
+	encSaltBlob, err := Enc_then_mac_hash(K2, saltIV[:], salt[:16])
+	if err != nil {
+		return nil, err
+	}
+
+	encSaltBytes, err := json.Marshal(encSaltBlob)
+	if err != nil {
+		return nil, errors.New("InitUser: error while marshaling encrypted salt")
+	}
+
+	userlib.DatastoreSet(saltUUID, encSaltBytes)
+
+	// Slow hash SK from password and salt
+	SK, err := slow_hash([]byte(password), salt[:16])
+	if err != nil {
+		return nil, err
+	}
+
+	// generate keypair and put public key in Keystore username -> key
+	publicKey, privateKey, err := userlib.PKEKeyGen()
+	if err != nil {
+		return nil, err
+	}
+
+	userlib.KeystoreSet(username, publicKey)
+
+	// Encrypt private key with SK and store under privateKeyUUID
+	privateKeyIV := uuid.New()
+
+	// key to bytes before encryption
+	privBytes, err := json.Marshal(privateKey)
+	if err != nil {
+		return nil, errors.New("InitUser: failed to marshal private key")
+	}
+
+	encPrivBlob, err := Enc_then_mac_hash(SK, privateKeyIV[:], privBytes)
+	if err != nil {
+		return nil, errors.New("InitUser: failed to encrypt then MAC private key")
+	}
+
+	encPrivBytes, err := json.Marshal(encPrivBlob)
+	if err != nil {
+		return nil, errors.New("InitUser: failed to marshal encrypted private key")
+	}
+
+	userlib.DatastoreSet(privateKeyUUID, encPrivBytes)
+
+	// Construct local user struct
+	user := &User{
+		Username:   username,
+		SK:         SK,
+		PrivateKey: privateKey,
+		PublicKey:  publicKey,
+	}
+
+	return user, nil
+}
+
+
 func GetUser(username string, password string) (userdataptr *User, err error) {
-	// Step 0: Input validation
+	// Check length username nonzero
 	if len(username) == 0 {
 		return nil, errors.New("GetUser: username cannot be empty")
 	}
-	fmt.Println("GetUser: Starting for", username)
 
-	// Step 1: Compute deterministic UUID for username
+	// Compute deterministic UUID for username
 	userUUID, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
 	if err != nil {
 		return nil, errors.New("GetUser: failed to compute UUID for username")
 	}
-	fmt.Println("GetUser: Computed UUID for username")
 
+	// Make sure username exists
 	data, ok := userlib.DatastoreGet(userUUID)
 	if !ok {
 		return nil, errors.New("GetUser: user does not exist in datastore")
 	}
-	fmt.Println("GetUser: Found user struct in datastore")
 
-	// Step 2: Derive fastSK, SK1, SK2
-	fastSK := userlib.Hash([]byte(password))
-	KDF_output, err := userlib.HashKDF(fastSK, []byte("key one"))
+	// Derive key K
+	K := userlib.Hash([]byte(password))
+	KDF_output, err := userlib.HashKDF(K[:16], []byte("key one"))
 	if err != nil {
 		return nil, errors.New("GetUser: HashKDF failed for password")
 	}
-	SK1 := KDF_output[:16]
-	SK2 := KDF_output[16:32]
-	fmt.Println("GetUser: Derived SK1 and SK2")
+	if len(KDF_output) < 32 {
+		return nil, errors.New("GetUser: insufficient KDF output length")
+	}
+	K1 := KDF_output[:16]
+	K2 := KDF_output[16:32]
 
-	// Step 3: Unmarshal and decrypt user metadata
+	// Unmarshal and decrypt user metadata
 	var userRecord EncryptedBlob
-	err = json.Unmarshal(data, &userRecord)
-	if err != nil {
+	if err := json.Unmarshal(data, &userRecord); err != nil {
 		return nil, errors.New("GetUser: failed to unmarshal user record blob")
 	}
-	fmt.Println("GetUser: Unmarshaled user encrypted blob")
 
-	decryptedUserStruct, err := Mac_hash_then_decrypt(SK1, userRecord)
+	decryptedUserStruct, err := Mac_hash_then_decrypt(K1, userRecord)
 	if err != nil {
 		return nil, errors.New("GetUser: user struct MAC check failed or password incorrect")
 	}
-	fmt.Println("GetUser: Decrypted and validated user metadata")
 
 	var userStruct UserObject
-	err = json.Unmarshal(decryptedUserStruct, &userStruct)
-	if err != nil {
+	if err := json.Unmarshal(decryptedUserStruct, &userStruct); err != nil {
 		return nil, errors.New("GetUser: malformed user metadata after decryption")
 	}
-	fmt.Println("GetUser: Parsed SaltUUID and PrivateKeyUUID")
 
-	// Step 4: Load and decrypt salt
+	// Load and decrypt salt
 	saltBlobBytes, ok := userlib.DatastoreGet(userStruct.SaltUUID)
 	if !ok {
 		return nil, errors.New("GetUser: salt not found in datastore")
 	}
-	fmt.Println("GetUser: Found salt blob")
 
 	var saltBlob EncryptedBlob
-	err = json.Unmarshal(saltBlobBytes, &saltBlob)
-	if err != nil {
+	if err := json.Unmarshal(saltBlobBytes, &saltBlob); err != nil {
 		return nil, errors.New("GetUser: malformed salt encrypted blob")
 	}
 
-	saltBytes, err := Mac_hash_then_decrypt(SK2, saltBlob)
+	saltBytes, err := Mac_hash_then_decrypt(K2, saltBlob)
 	if err != nil {
 		return nil, errors.New("GetUser: salt MAC check failed or password incorrect")
 	}
-	fmt.Println("GetUser: Decrypted and validated salt")
 
-	// Step 5: Slow hash to derive SK
-	SK := userlib.Argon2Key([]byte(password), saltBytes, 32)
-	fmt.Println("GetUser: Derived SK with Argon2")
+	// Slow hash to derive SK 
+	SK, err := slow_hash([]byte(password), saltBytes)
+	if err != nil {
+		return nil, errors.New("GetUser: slow_hash failed")
+	}
 
-	// Step 6: Load and decrypt private key
+	// Load and decrypt private key
 	privateKeyBlobBytes, ok := userlib.DatastoreGet(userStruct.PrivateKeyUUID)
 	if !ok {
 		return nil, errors.New("GetUser: private key not found in datastore")
 	}
-	fmt.Println("GetUser: Found private key blob")
 
 	var privateKeyBlob EncryptedBlob
-	err = json.Unmarshal(privateKeyBlobBytes, &privateKeyBlob)
-	if err != nil {
+	if err := json.Unmarshal(privateKeyBlobBytes, &privateKeyBlob); err != nil {
 		return nil, errors.New("GetUser: malformed encrypted private key blob")
 	}
 
@@ -346,34 +419,33 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 	if err != nil {
 		return nil, errors.New("GetUser: private key MAC check failed or password incorrect")
 	}
-	fmt.Println("GetUser: Decrypted private key")
 
 	var privateKey userlib.PKEDecKey
-	err = json.Unmarshal(privateKeyBytes, &privateKey)
-	if err != nil {
+	if err := json.Unmarshal(privateKeyBytes, &privateKey); err != nil {
 		return nil, errors.New("GetUser: private key could not be unmarshaled")
 	}
-	fmt.Println("GetUser: Parsed private key")
 
-	// Step 7: Load public key from keystore
+	// Load public key from keystore
 	publicKey, ok := userlib.KeystoreGet(username)
 	if !ok {
 		return nil, errors.New("GetUser: public key not found in keystore")
 	}
-	fmt.Println("GetUser: Retrieved public key from keystore")
 
-	// Step 8: Construct and return user struct
+	// Construct and return user struct
 	returnUser := &User{
 		Username:   username,
 		SK:         SK,
 		PrivateKey: privateKey,
 		PublicKey:  publicKey,
 	}
-	fmt.Println("GetUser: User struct constructed and returned")
 	return returnUser, nil
 }
 
+
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
+
+	
+
 	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
 	if err != nil {
 		return err
