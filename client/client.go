@@ -135,10 +135,11 @@ type UserObject struct {
 }
 
 type FileObject struct {
-	Head uuid.UUID
-	Tail uuid.UUID
-	Key  []byte
-	Tree uuid.UUID
+	Head  uuid.UUID
+	Tail  uuid.UUID
+	Key   []byte
+	Tree  uuid.UUID
+	Owner string
 }
 
 type FileContent struct {
@@ -146,53 +147,42 @@ type FileContent struct {
 	Next    uuid.UUID
 }
 
+type Invitation struct {
+	FileUUID uuid.UUID // Pointer to shared file
+	FileKey  []byte    // Symmetric key to decrypt FileObject and contents
+	FromUser string    // Who shared it
+}
+
 // Helper Functions
 
-func Enc_then_mac_hash(K []byte, IV []byte, message []byte) (blob EncryptedBlob, err error) {
-	// IV length check
-	if len(IV) != 16 {
-		return EncryptedBlob{}, errors.New("invalid IV length")
-	}
-
-	// Derive encryption and MAC keys from K
+func Enc_then_mac_hash(K []byte, IV []byte, plaintext []byte) (EncryptedBlob, error) {
 	KDFOutput, err := userlib.HashKDF(K, []byte("key one"))
 	if err != nil {
 		return EncryptedBlob{}, err
 	}
-	if len(KDFOutput) < 32 {
-		return EncryptedBlob{}, errors.New("insufficient KDF output length")
-	}
 	K1 := KDFOutput[:16]
 	K2 := KDFOutput[16:32]
 
-	// Encrypt
-	ciphertext := userlib.SymEnc(K1, IV, message)
-
-	// MAC over IV || ciphertext
-	macInput := append(IV, ciphertext...)
+	ciphertext := userlib.SymEnc(K1, IV, plaintext)
+	macInput := append(append([]byte{}, IV...), ciphertext...)
 	mac, err := userlib.HMACEval(K2, macInput)
 	if err != nil {
 		return EncryptedBlob{}, err
 	}
 
-	blob = EncryptedBlob{
-		IV:         IV,
-		Ciphertext: ciphertext,
-		MAC:        mac,
-	}
-	return blob, nil
+	return EncryptedBlob{IV: IV, Ciphertext: ciphertext, MAC: mac}, nil
 }
 
 func Mac_hash_then_decrypt(K []byte, blob EncryptedBlob) (plaintext []byte, err error) {
-	// Basic checks
+	// Validate blob
 	if len(blob.IV) != 16 {
 		return nil, errors.New("invalid IV length")
 	}
-	if len(blob.Ciphertext) == 0 {
-		return nil, errors.New("empty ciphertext")
+	if len(blob.Ciphertext) == 0 || len(blob.MAC) == 0 {
+		return nil, errors.New("invalid blob: missing fields")
 	}
 
-	// Derive encryption and MAC keys from K
+	// Derive K1 (encryption) and K2 (MAC) from K
 	KDFOutput, err := userlib.HashKDF(K, []byte("key one"))
 	if err != nil {
 		return nil, err
@@ -203,17 +193,18 @@ func Mac_hash_then_decrypt(K []byte, blob EncryptedBlob) (plaintext []byte, err 
 	K1 := KDFOutput[:16]
 	K2 := KDFOutput[16:32]
 
-	// Verify MAC over IV || ciphertext
-	macInput := append(blob.IV, blob.Ciphertext...)
-	expectedMac, err := userlib.HMACEval(K2, macInput)
+	// Verify MAC = HMAC(K2, IV || ciphertext)
+	macInput := append(append([]byte{}, blob.IV...), blob.Ciphertext...)
+	expectedMAC, err := userlib.HMACEval(K2, macInput)
 	if err != nil {
 		return nil, err
 	}
-	if !userlib.HMACEqual(expectedMac, blob.MAC) {
-		return nil, errors.New("MAC mismatch")
+
+	if !userlib.HMACEqual(expectedMAC, blob.MAC) {
+		return nil, errors.New("integrity check failed: MAC mismatch")
 	}
 
-	// Decrypt
+	// Decrypt and return plaintext
 	plaintext = userlib.SymDec(K1, blob.Ciphertext)
 	return plaintext, nil
 }
@@ -512,6 +503,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		Key:  fileKey,
 		Tree: uuid.Nil, // placeholder for ownership tree
 	}
+	fileObj.Owner = userdata.Username
 
 	fileUUID := uuid.New()
 	objBytes, err := json.Marshal(fileObj)
@@ -519,12 +511,28 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return fmt.Errorf("StoreFile: failed to marshal FileObject: %v", err)
 	}
 	IV2 := userlib.RandomBytes(16)
-	encObj, err := Enc_then_mac_hash(userdata.SK, IV2, objBytes)
+	encObj, err := Enc_then_mac_hash(fileObj.Key, IV2, objBytes)
+
 	if err != nil {
 		return fmt.Errorf("StoreFile: failed to encrypt FileObject: %v", err)
 	}
 	encObjBytes, _ := json.Marshal(encObj)
 	userlib.DatastoreSet(fileUUID, encObjBytes)
+
+	// Store encrypted copy of fileKey under deterministic UUID
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+
+	encFileKey, err := Enc_then_mac_hash(userdata.SK, userlib.RandomBytes(16), fileKey)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to encrypt file key: %v", err)
+	}
+	encFileKeyBytes, err := json.Marshal(encFileKey)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to marshal encrypted file key: %v", err)
+	}
+
+	userlib.DatastoreSet(keyUUID, encFileKeyBytes)
 
 	// Add entry in file map
 	fileMap[filename] = fileUUID
@@ -586,7 +594,25 @@ func (userdata *User) AppendToFile(filename string, content []byte) (err error) 
 	if err = json.Unmarshal(fileObjBytes, &encFileObj); err != nil {
 		return errors.New("AppendToFile: failed to unmarshal file object blob")
 	}
-	fileObjPlain, err := Mac_hash_then_decrypt(userdata.SK, encFileObj)
+	// Retrieve file key from keyUUID
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+	encFileKeyBytes, ok := userlib.DatastoreGet(keyUUID)
+	if !ok {
+		return errors.New("AppendToFile: file key not found")
+	}
+
+	var encFileKey EncryptedBlob
+	if err = json.Unmarshal(encFileKeyBytes, &encFileKey); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal file key blob")
+	}
+	fileKey, err := Mac_hash_then_decrypt(userdata.SK, encFileKey)
+	if err != nil {
+		return errors.New("AppendToFile: file key integrity check failed")
+	}
+
+	// use fileKey instead of SK
+	fileObjPlain, err := Mac_hash_then_decrypt(fileKey, encFileObj)
 	if err != nil {
 		return errors.New("AppendToFile: file metadata integrity check failed")
 	}
@@ -657,7 +683,8 @@ func (userdata *User) AppendToFile(filename string, content []byte) (err error) 
 		return fmt.Errorf("AppendToFile: failed to marshal updated file object: %v", err)
 	}
 	IV3 := userlib.RandomBytes(16)
-	fileObjEnc, err := Enc_then_mac_hash(userdata.SK, IV3, fileObjBytes)
+	fileObjEnc, err := Enc_then_mac_hash(fileObj.Key, IV3, fileObjBytes)
+
 	if err != nil {
 		return fmt.Errorf("AppendToFile: failed to encrypt updated file object: %v", err)
 	}
@@ -706,17 +733,38 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	}
 
 	// Fetch and decrypt FileObject (metadata)
-	fileData, ok := userlib.DatastoreGet(fileUUID)
+	encFileObj, ok := userlib.DatastoreGet(fileUUID)
 	if !ok {
-		return nil, errors.New("LoadFile: missing file metadata")
+		return nil, errors.New("LoadFile: file metadata not found")
 	}
 
-	var encFileObj EncryptedBlob
-	if err = json.Unmarshal(fileData, &encFileObj); err != nil {
-		return nil, errors.New("LoadFile: failed to unmarshal encrypted file object")
+	// Step 4: Retrieve your copy of the FileKey (stored under something like "filekey_"+filename)
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+	encFileKeyBytes, ok := userlib.DatastoreGet(keyUUID)
+	if !ok {
+		return nil, errors.New("LoadFile: file key not found")
 	}
 
-	fileObjPlain, err := Mac_hash_then_decrypt(userdata.SK, encFileObj)
+	// Unmarshal into EncryptedBlob
+	var encFileKey EncryptedBlob
+	if err := json.Unmarshal(encFileKeyBytes, &encFileKey); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal file key blob")
+	}
+
+	// Decrypt using user's SK
+	fileKey, err := Mac_hash_then_decrypt(userdata.SK, encFileKey)
+	if err != nil {
+		return nil, errors.New("LoadFile: file key integrity check failed")
+	}
+
+	// Use FileKey to decrypt the actual file metadata
+	var encFileObjBlob EncryptedBlob
+	if err = json.Unmarshal(encFileObj, &encFileObjBlob); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal file object blob")
+	}
+	fileObjPlain, err := Mac_hash_then_decrypt(fileKey, encFileObjBlob)
+
 	if err != nil {
 		return nil, errors.New("LoadFile: file metadata integrity check failed")
 	}
@@ -756,15 +804,366 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	return content, nil
 }
 
-func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
-	invitationPtr uuid.UUID, err error) {
-	return
+func (userdata *User) CreateInvitation(filename, recipient string) (invitationPtr uuid.UUID, err error) {
+	// Locate user’s file map
+	// Hash(SK || "filemap") → deterministic UUID
+	// Load file map and find fileUUID for filename.
+
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, err := uuid.FromBytes(mapUUIDBytes)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	// Retrieve and decrypt user’s file map
+	mapData, ok := userlib.DatastoreGet(mapUUID)
+	if !ok {
+		return uuid.Nil, errors.New("CreateInvitation: file map not found")
+	}
+	var encMapBlob EncryptedBlob
+	if err = json.Unmarshal(mapData, &encMapBlob); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to unmarshal map")
+	}
+	mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: map integrity check failed")
+	}
+	var fileMap map[string]uuid.UUID
+	if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to unmarshal map")
+	}
+
+	// Look up target file
+	fileUUID, exists := fileMap[filename]
+	if !exists {
+		return uuid.Nil, errors.New("CreateInvitation: file not found")
+	}
+
+	// Get recipient’s public key from keystore
+	pubKey, ok := userlib.KeystoreGet(recipient)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("CreateInvitation: recipient not found")
+	}
+
+	// Decrypt your FileObject to get file key
+	// Use userdata.SK → decrypt fileUUID’s object → get fileObj.Key
+	fileObjBytes, ok := userlib.DatastoreGet(fileUUID)
+	if !ok {
+		return uuid.Nil, errors.New("CreateInvitation: file metadata not found")
+	}
+
+	// Retrieve your encrypted fileKey
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+	encFileKeyBytes, ok := userlib.DatastoreGet(keyUUID)
+	if !ok {
+		return uuid.Nil, errors.New("CreateInvitation: file key not found")
+	}
+
+	var encFileKey EncryptedBlob
+	if err = json.Unmarshal(encFileKeyBytes, &encFileKey); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to unmarshal file key blob")
+	}
+
+	fileKey, err := Mac_hash_then_decrypt(userdata.SK, encFileKey)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: file key integrity check failed")
+	}
+
+	// Decrypt FileObject with fileKey
+	var encFileObjBlob EncryptedBlob
+	if err = json.Unmarshal(fileObjBytes, &encFileObjBlob); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to unmarshal file object blob")
+	}
+
+	fileObjPlain, err := Mac_hash_then_decrypt(fileKey, encFileObjBlob)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: file metadata integrity check failed")
+	}
+
+	var fileObj FileObject
+	if err = json.Unmarshal(fileObjPlain, &fileObj); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to unmarshal FileObject")
+	}
+
+	// Create invitation struct
+	invite := Invitation{
+		FileUUID: fileUUID,
+		FileKey:  fileObj.Key,
+		FromUser: userdata.Username,
+	}
+
+	// Marshal invitation
+	inviteBytes, err := json.Marshal(invite)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateInvitation: marshal failed: %v", err)
+	}
+
+	// Encrypt invitation using recipient’s public key
+	encInvite, err := userlib.PKEEnc(pubKey, inviteBytes)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateInvitation: PKEEnc failed: %v", err)
+	}
+
+	// Compute a MAC over the ciphertext for integrity
+	macKey := userlib.Hash([]byte(userdata.Username + recipient))[:16]
+	mac, err := userlib.HMACEval(macKey, encInvite)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateInvitation: HMAC integrity failed: %v", err)
+	}
+	// Combine ciphertext + MAC
+	inviteBlob := append(encInvite, mac...)
+
+	// Store in datastore
+	inviteUUID := uuid.New()
+	userlib.DatastoreSet(inviteUUID, inviteBlob)
+	return inviteUUID, nil
+
 }
 
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
+	// Fetch invitation from datastore
+	inviteData, ok := userlib.DatastoreGet(invitationPtr)
+	if !ok {
+		return errors.New("AcceptInvitation: invitation not found")
+	}
+
+	// Split ciphertext and MAC (verify integrity)
+	hashSize := len(userlib.Hash([]byte("example")))
+	if len(inviteData) < hashSize {
+		return errors.New("AcceptInvitation: invalid invitation format")
+	}
+
+	ciphertext := inviteData[:len(inviteData)-hashSize]
+	storedMAC := inviteData[len(inviteData)-hashSize:]
+
+	// Recompute expected MAC using sender+recipient HMAC key
+	macKey := userlib.Hash([]byte(senderUsername + userdata.Username))[:16]
+	expectedMAC, err := userlib.HMACEval(macKey, ciphertext)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: HMAC eval failed: %v", err)
+	}
+	if !userlib.HMACEqual(storedMAC, expectedMAC) {
+		return errors.New("AcceptInvitation: integrity check failed (MAC mismatch)")
+	}
+
+	// Decrypt invitation ciphertext with your private key
+	plaintext, err := userlib.PKEDec(userdata.PrivateKey, ciphertext)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: decryption failed: %v", err)
+	}
+
+	// Unmarshal Invitation
+	var invite Invitation
+	if err = json.Unmarshal(plaintext, &invite); err != nil {
+		return fmt.Errorf("AcceptInvitation: failed to unmarshal invite: %v", err)
+	}
+
+	if _, ok := userlib.DatastoreGet(invite.FileUUID); !ok {
+		return errors.New("AcceptInvitation: file no longer valid (revoked or deleted)")
+	}
+
+	// Check if invitation's file key is still valid
+	fileBytes, ok := userlib.DatastoreGet(invite.FileUUID)
+	if ok {
+		var encFileBlob EncryptedBlob
+		if err := json.Unmarshal(fileBytes, &encFileBlob); err != nil {
+			return errors.New("AcceptInvitation: invalid file object (tampered or revoked)")
+		}
+		if _, err := Mac_hash_then_decrypt(invite.FileKey, encFileBlob); err != nil {
+			return errors.New("AcceptInvitation: file revoked or invalid key")
+		}
+	}
+
+	// Load or initialize recipient’s file map
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, err := uuid.FromBytes(mapUUIDBytes)
+	if err != nil {
+		return err
+	}
+
+	var fileMap map[string]uuid.UUID
+	mapData, exists := userlib.DatastoreGet(mapUUID)
+	if exists {
+		var encMapBlob EncryptedBlob
+		if err = json.Unmarshal(mapData, &encMapBlob); err != nil {
+			return errors.New("AcceptInvitation: failed to unmarshal map blob")
+		}
+		mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+		if err != nil {
+			return errors.New("AcceptInvitation: map integrity check failed")
+		}
+		if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+			return errors.New("AcceptInvitation: failed to unmarshal map")
+		}
+	} else {
+		fileMap = make(map[string]uuid.UUID)
+	}
+
+	// Check if filename already exists
+	if _, exists := fileMap[filename]; exists {
+		return errors.New("AcceptInvitation: filename already exists")
+	}
+
+	// Add shared file reference
+	fileMap[filename] = invite.FileUUID
+
+	// Re-encrypt and store file map
+	mapBytes, err := json.Marshal(fileMap)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: marshal map failed: %v", err)
+	}
+	IV := userlib.RandomBytes(16)
+	encMap, err := Enc_then_mac_hash(userdata.SK, IV, mapBytes)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: encrypt map failed: %v", err)
+	}
+	encMapBytes, err := json.Marshal(encMap)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: failed to marshal encrypted map: %v", err)
+	}
+	userlib.DatastoreSet(mapUUID, encMapBytes)
+
+	// Store recipient’s encrypted copy of fileKey
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+
+	encFileKey, err := Enc_then_mac_hash(userdata.SK, userlib.RandomBytes(16), invite.FileKey)
+	if err != nil {
+		return fmt.Errorf("AcceptInvitation: failed to encrypt file key: %v", err)
+	}
+	encFileKeyBytes, _ := json.Marshal(encFileKey)
+	userlib.DatastoreSet(keyUUID, encFileKeyBytes)
+
+	// Delete invitation
+	userlib.DatastoreDelete(invitationPtr)
+
 	return nil
 }
 
-func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
+func (userdata *User) RevokeAccess(filename string, targetUsername string) error {
+	if _, ok := userlib.KeystoreGet(targetUsername); !ok {
+		return errors.New("RevokeAccess: target user does not exist")
+	}
+	// Load user’s file map
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, _ := uuid.FromBytes(mapUUIDBytes)
+	mapData, ok := userlib.DatastoreGet(mapUUID)
+	if !ok {
+		return errors.New("RevokeAccess: file map not found")
+	}
+
+	var encMapBlob EncryptedBlob
+	if err := json.Unmarshal(mapData, &encMapBlob); err != nil {
+		return errors.New("RevokeAccess: failed to unmarshal map blob")
+	}
+	mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+	if err != nil {
+		return errors.New("RevokeAccess: map integrity check failed")
+	}
+
+	var fileMap map[string]uuid.UUID
+	if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+		return errors.New("RevokeAccess: failed to unmarshal map")
+	}
+
+	fileUUID, exists := fileMap[filename]
+	if !exists {
+		return errors.New("RevokeAccess: file not found")
+	}
+
+	// Decrypt the file object
+	fileBytes, ok := userlib.DatastoreGet(fileUUID)
+	if !ok {
+		return errors.New("RevokeAccess: file metadata not found")
+	}
+
+	var encFileObj EncryptedBlob
+	if err = json.Unmarshal(fileBytes, &encFileObj); err != nil {
+		return errors.New("RevokeAccess: failed to unmarshal file blob")
+	}
+
+	// Decrypt current file key
+	keyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userdata.SK)))[:16]
+	keyUUID, _ := uuid.FromBytes(keyUUIDBytes)
+	encFileKeyBytes, ok := userlib.DatastoreGet(keyUUID)
+	if !ok {
+		return errors.New("RevokeAccess: file key not found")
+	}
+
+	var encFileKey EncryptedBlob
+	if err = json.Unmarshal(encFileKeyBytes, &encFileKey); err != nil {
+		return errors.New("RevokeAccess: failed to unmarshal file key")
+	}
+	fileKey, err := Mac_hash_then_decrypt(userdata.SK, encFileKey)
+	if err != nil {
+		return errors.New("RevokeAccess: file key integrity check failed")
+	}
+
+	filePlain, err := Mac_hash_then_decrypt(fileKey, encFileObj)
+	if err != nil {
+		return errors.New("RevokeAccess: file metadata integrity check failed")
+	}
+
+	var fileObj FileObject
+	if err = json.Unmarshal(filePlain, &fileObj); err != nil {
+		return errors.New("RevokeAccess: failed to unmarshal FileObject")
+	}
+
+	// Ownership check
+	if fileObj.Owner != userdata.Username {
+		return errors.New("RevokeAccess: only owner can revoke")
+	}
+
+	// Generate new key for file (rotating key)
+	newKey := userlib.RandomBytes(16)
+
+	// Re-encrypt all content nodes
+	current := fileObj.Head
+	for current != uuid.Nil {
+		nodeBytes, ok := userlib.DatastoreGet(current)
+		if !ok {
+			return fmt.Errorf("RevokeAccess: node tampered or corrupted: %v", err)
+		}
+		var encNode EncryptedBlob
+		if err := json.Unmarshal(nodeBytes, &encNode); err != nil {
+			return fmt.Errorf("RevokeAccess: node tampered or corrupted: %v", err)
+		}
+		nodePlain, err := Mac_hash_then_decrypt(fileObj.Key, encNode)
+		if err != nil {
+			return fmt.Errorf("RevokeAccess: node integrity check failed: %v", err)
+		}
+
+		var node FileContent
+		err = json.Unmarshal(nodePlain, &node)
+		if err != nil {
+			return fmt.Errorf("integrity check failed: %v", err)
+		}
+		IV := userlib.RandomBytes(16)
+		newEnc, _ := Enc_then_mac_hash(newKey, IV, nodePlain)
+		newEncBytes, _ := json.Marshal(newEnc)
+		userlib.DatastoreSet(current, newEncBytes)
+
+		current = node.Next
+	}
+
+	// Re-encrypt file object with new key
+	fileObj.Key = newKey
+	objBytes, _ := json.Marshal(fileObj)
+	IV := userlib.RandomBytes(16)
+	newEncObj, _ := Enc_then_mac_hash(newKey, IV, objBytes)
+	newEncObjBytes, _ := json.Marshal(newEncObj)
+	userlib.DatastoreSet(fileUUID, newEncObjBytes)
+
+	// Update owner’s key reference
+	newEncFileKey, _ := Enc_then_mac_hash(userdata.SK, userlib.RandomBytes(16), newKey)
+	newEncFileKeyBytes, _ := json.Marshal(newEncFileKey)
+	userlib.DatastoreSet(keyUUID, newEncFileKeyBytes)
+
+	// Remove target user’s access
+	targetKeyUUIDBytes := userlib.Hash([]byte("filekey_" + filename + hex.EncodeToString(userlib.Hash([]byte(targetUsername)))))[:16]
+	targetKeyUUID, _ := uuid.FromBytes(targetKeyUUIDBytes)
+	userlib.DatastoreDelete(targetKeyUUID)
+
 	return nil
 }
