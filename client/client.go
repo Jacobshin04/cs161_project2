@@ -15,6 +15,7 @@ package client
 // - strings
 
 import (
+	"encoding/hex"
 	"encoding/json"
 
 	userlib "github.com/cs161-staff/project2-userlib"
@@ -23,7 +24,6 @@ import (
 	// hex.EncodeToString(...) is useful for converting []byte to string
 
 	// Useful for string manipulation
-	"strings"
 
 	// Useful for formatting strings (e.g. `fmt.Sprintf`).
 	"fmt"
@@ -132,6 +132,18 @@ type EncryptedBlob struct {
 type UserObject struct {
 	SaltUUID       uuid.UUID
 	PrivateKeyUUID uuid.UUID
+}
+
+type FileObject struct {
+	Head uuid.UUID
+	Tail uuid.UUID
+	Key  []byte
+	Tree uuid.UUID
+}
+
+type FileContent struct {
+	Content []byte
+	Next    uuid.UUID
 }
 
 // Helper Functions
@@ -335,7 +347,6 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	return user, nil
 }
 
-
 func GetUser(username string, password string) (userdataptr *User, err error) {
 	// Check length username nonzero
 	if len(username) == 0 {
@@ -398,7 +409,7 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 		return nil, errors.New("GetUser: salt MAC check failed or password incorrect")
 	}
 
-	// Slow hash to derive SK 
+	// Slow hash to derive SK
 	SK, err := slow_hash([]byte(password), saltBytes)
 	if err != nil {
 		return nil, errors.New("GetUser: slow_hash failed")
@@ -441,38 +452,308 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 	return returnUser, nil
 }
 
-
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
-
-	
-
-	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+	// Derive deterministic UUID for this user’s encrypted file map
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, err := uuid.FromBytes(mapUUIDBytes)
 	if err != nil {
 		return err
 	}
-	contentBytes, err := json.Marshal(content)
-	if err != nil {
-		return err
+
+	// Load or initialize file map
+	data, exists := userlib.DatastoreGet(mapUUID)
+	var fileMap map[string]uuid.UUID
+	if exists {
+		var encMapBlob EncryptedBlob
+		if err = json.Unmarshal(data, &encMapBlob); err != nil {
+			return errors.New("StoreFile: unmarshal map failed")
+		}
+		mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+		if err != nil {
+			return errors.New("StoreFile: map integrity check failed")
+		}
+		if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+			return errors.New("StoreFile: unmarshal map failed")
+		}
+	} else {
+		fileMap = make(map[string]uuid.UUID)
 	}
-	userlib.DatastoreSet(storageKey, contentBytes)
-	return
+
+	// Generate random key for this file
+	fileKey := userlib.RandomBytes(16)
+
+	// Create first content node
+	headUUID := uuid.New()
+	fileContent := FileContent{
+		Content: content,
+		Next:    uuid.Nil,
+	}
+
+	nodeBytes, err := json.Marshal(fileContent)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to marshal content node: %v", err)
+	}
+	IV1 := userlib.RandomBytes(16)
+	encNode, err := Enc_then_mac_hash(fileKey, IV1, nodeBytes)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to encrypt node: %v", err)
+	}
+	encNodeBytes, err := json.Marshal(encNode)
+	if err != nil {
+		return fmt.Errorf("failed to marshal node encryption: %v", err)
+	}
+
+	userlib.DatastoreSet(headUUID, encNodeBytes)
+
+	// Create FileObject with Head, Tail, Key, and placeholder Tree
+	fileObj := FileObject{
+		Head: headUUID,
+		Tail: headUUID,
+		Key:  fileKey,
+		Tree: uuid.Nil, // placeholder for ownership tree
+	}
+
+	fileUUID := uuid.New()
+	objBytes, err := json.Marshal(fileObj)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to marshal FileObject: %v", err)
+	}
+	IV2 := userlib.RandomBytes(16)
+	encObj, err := Enc_then_mac_hash(userdata.SK, IV2, objBytes)
+	if err != nil {
+		return fmt.Errorf("StoreFile: failed to encrypt FileObject: %v", err)
+	}
+	encObjBytes, _ := json.Marshal(encObj)
+	userlib.DatastoreSet(fileUUID, encObjBytes)
+
+	// Add entry in file map
+	fileMap[filename] = fileUUID
+
+	// Re-encrypt and save file map
+	mapBytes, err := json.Marshal(fileMap)
+	if err != nil {
+		return fmt.Errorf("StoreFile: marshal map failed: %v", err)
+	}
+	IV3 := userlib.RandomBytes(16)
+	blob, err := Enc_then_mac_hash(userdata.SK, IV3, mapBytes)
+	if err != nil {
+		return fmt.Errorf("StoreFile: encrypt map failed: %v", err)
+	}
+	blobBytes, _ := json.Marshal(blob)
+	userlib.DatastoreSet(mapUUID, blobBytes)
+
+	return nil
 }
 
-func (userdata *User) AppendToFile(filename string, content []byte) error {
+func (userdata *User) AppendToFile(filename string, content []byte) (err error) {
+	// Derive deterministic UUID for this user’s encrypted file map
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, err := uuid.FromBytes(mapUUIDBytes)
+	if err != nil {
+		return err
+	}
+
+	// Retrieve and decrypt user’s file map
+	mapData, ok := userlib.DatastoreGet(mapUUID)
+	if !ok {
+		return errors.New("AppendToFile: file map not found")
+	}
+	var encMapBlob EncryptedBlob
+	if err = json.Unmarshal(mapData, &encMapBlob); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal map")
+	}
+	mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+	if err != nil {
+		return errors.New("AppendToFile: map integrity check failed")
+	}
+	var fileMap map[string]uuid.UUID
+	if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal map")
+	}
+
+	// Look up target file
+	fileUUID, exists := fileMap[filename]
+	if !exists {
+		return errors.New("AppendToFile: file not found")
+	}
+
+	// Fetch and decrypt file object (contains head, tail, key, etc.)
+	fileObjBytes, ok := userlib.DatastoreGet(fileUUID)
+	if !ok {
+		return errors.New("AppendToFile: missing file metadata")
+	}
+	var encFileObj EncryptedBlob
+	if err = json.Unmarshal(fileObjBytes, &encFileObj); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal file object blob")
+	}
+	fileObjPlain, err := Mac_hash_then_decrypt(userdata.SK, encFileObj)
+	if err != nil {
+		return errors.New("AppendToFile: file metadata integrity check failed")
+	}
+	var fileObj FileObject
+	if err = json.Unmarshal(fileObjPlain, &fileObj); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal FileObject")
+	}
+
+	// Create new content node for appended data
+	var fileContent FileContent
+	fileContent.Content = content
+	fileContent.Next = uuid.Nil
+	fileContentUUID := uuid.New()
+
+	// Encrypt and store new node
+	IV1 := userlib.RandomBytes(16)
+	fileContentBlobBytes, err := json.Marshal(fileContent)
+	if err != nil {
+		return fmt.Errorf("marshal file blob failed: %v", err)
+	}
+	fileContentBlob, err := Enc_then_mac_hash(fileObj.Key, IV1, fileContentBlobBytes)
+	if err != nil {
+		return fmt.Errorf("encrypt file failed: %v", err)
+	}
+	fileContentBlobBytesEnc, err := json.Marshal(fileContentBlob)
+	if err != nil {
+		return fmt.Errorf("marshal encrypted file blob failed: %v", err)
+	}
+	userlib.DatastoreSet(fileContentUUID, fileContentBlobBytesEnc)
+
+	// Load old tail node and link it to the new node
+	oldTailUUID := fileObj.Tail
+	oldTailData, ok := userlib.DatastoreGet(oldTailUUID)
+	if !ok {
+		return fmt.Errorf("AppendToFile: old tail node not found in datastore")
+	}
+	var encryptedTailBlob EncryptedBlob
+	if err = json.Unmarshal(oldTailData, &encryptedTailBlob); err != nil {
+		return errors.New("AppendToFile: failed to unmarshal file object blob")
+	}
+	oldTailPlain, err := Mac_hash_then_decrypt(fileObj.Key, encryptedTailBlob)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: old tail node integrity check failed")
+	}
+	var oldTail FileContent
+	if err = json.Unmarshal(oldTailPlain, &oldTail); err != nil {
+		return fmt.Errorf("AppendToFile: failed to unmarshal old tail node")
+	}
+	oldTail.Next = fileContentUUID
+
+	// Re-encrypt updated old tail and store
+	oldTailBytes, err := json.Marshal(oldTail)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: failed to marshal updated tail node: %v", err)
+	}
+	IV2 := userlib.RandomBytes(16)
+	oldTailEnc, err := Enc_then_mac_hash(fileObj.Key, IV2, oldTailBytes)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: failed to encrypt updated tail node: %v", err)
+	}
+	oldTailEncBytes, _ := json.Marshal(oldTailEnc)
+	userlib.DatastoreSet(oldTailUUID, oldTailEncBytes)
+
+	// Update file object’s tail and re-encrypt
+	fileObj.Tail = fileContentUUID
+	fileObjBytes, err = json.Marshal(fileObj)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: failed to marshal updated file object: %v", err)
+	}
+	IV3 := userlib.RandomBytes(16)
+	fileObjEnc, err := Enc_then_mac_hash(userdata.SK, IV3, fileObjBytes)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: failed to encrypt updated file object: %v", err)
+	}
+	fileObjEncBytes, err := json.Marshal(fileObjEnc)
+	if err != nil {
+		return fmt.Errorf("AppendToFile: failed to marshal encrypted file object: %v", err)
+	}
+	userlib.DatastoreSet(fileUUID, fileObjEncBytes)
+
 	return nil
 }
 
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
-	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+	// Derive deterministic UUID for user’s encrypted file map
+	mapUUIDBytes := userlib.Hash([]byte("filemap" + hex.EncodeToString(userdata.SK)))[:16]
+	mapUUID, err := uuid.FromBytes(mapUUIDBytes)
 	if err != nil {
 		return nil, err
 	}
-	dataJSON, ok := userlib.DatastoreGet(storageKey)
+
+	// Retrieve and decrypt user’s file map
+	mapData, ok := userlib.DatastoreGet(mapUUID)
 	if !ok {
-		return nil, errors.New(strings.ToTitle("file not found"))
+		return nil, errors.New("LoadFile: file map not found")
 	}
-	err = json.Unmarshal(dataJSON, &content)
-	return content, err
+
+	var encMapBlob EncryptedBlob
+	if err = json.Unmarshal(mapData, &encMapBlob); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal encrypted file map")
+	}
+
+	mapBytes, err := Mac_hash_then_decrypt(userdata.SK, encMapBlob)
+	if err != nil {
+		return nil, errors.New("LoadFile: file map integrity check failed")
+	}
+
+	var fileMap map[string]uuid.UUID
+	if err = json.Unmarshal(mapBytes, &fileMap); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal file map")
+	}
+
+	// Locate file entry
+	fileUUID, exists := fileMap[filename]
+	if !exists {
+		return nil, errors.New("LoadFile: file not found")
+	}
+
+	// Fetch and decrypt FileObject (metadata)
+	fileData, ok := userlib.DatastoreGet(fileUUID)
+	if !ok {
+		return nil, errors.New("LoadFile: missing file metadata")
+	}
+
+	var encFileObj EncryptedBlob
+	if err = json.Unmarshal(fileData, &encFileObj); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal encrypted file object")
+	}
+
+	fileObjPlain, err := Mac_hash_then_decrypt(userdata.SK, encFileObj)
+	if err != nil {
+		return nil, errors.New("LoadFile: file metadata integrity check failed")
+	}
+
+	var fileObj FileObject
+	if err = json.Unmarshal(fileObjPlain, &fileObj); err != nil {
+		return nil, errors.New("LoadFile: failed to unmarshal FileObject")
+	}
+
+	// Traverse linked list from Head to Tail
+	currentUUID := fileObj.Head
+	for currentUUID != uuid.Nil {
+		nodeBytes, ok := userlib.DatastoreGet(currentUUID)
+		if !ok {
+			return nil, fmt.Errorf("LoadFile: missing content node %v", currentUUID)
+		}
+
+		var encNode EncryptedBlob
+		if err = json.Unmarshal(nodeBytes, &encNode); err != nil {
+			return nil, fmt.Errorf("LoadFile: failed to unmarshal content node %v", currentUUID)
+		}
+
+		nodePlain, err := Mac_hash_then_decrypt(fileObj.Key, encNode)
+		if err != nil {
+			return nil, fmt.Errorf("LoadFile: integrity check failed for node %v", currentUUID)
+		}
+
+		var node FileContent
+		if err = json.Unmarshal(nodePlain, &node); err != nil {
+			return nil, fmt.Errorf("LoadFile: failed to decode node %v", currentUUID)
+		}
+
+		content = append(content, node.Content...)
+		currentUUID = node.Next
+	}
+
+	return content, nil
 }
 
 func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
