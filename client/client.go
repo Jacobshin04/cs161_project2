@@ -108,6 +108,9 @@ func someUsefulThings() {
 // This is the type definition for the User struct.
 // A Go struct is like a Python or Java class - it can have attributes
 // (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
+
+// {USER STRUCT}
+
 type User struct {
 	Username     string
 	SK           []byte
@@ -154,15 +157,19 @@ type FileContentNode struct {
 type UserFileObject struct {
 	HeadDummy uuid.UUID
 	TailDummy uuid.UUID
-	NodeDummy uuid.UUID
+	Node uuid.UUID
 	Owner     string
 	Signature []byte
 }
 
-type OwnershipNode struct {
+type NodeUFO struct {
 	Username           string
 	UserFileObjectUUID uuid.UUID
-	Children           []OwnershipNode
+	Children           []NodeUFO
+}
+
+type InvitationMetadata struct {
+	Used bool
 }
 
 // { HELPER FUNCTIONS }
@@ -334,11 +341,11 @@ func storeFileRoot(pub userlib.PKEEncKey, rootUUID uuid.UUID, root *FileRoot) er
 	return nil
 }
 
-// canonicalizeUFO creates the canonical form by zeroing Signature+NodeDummy
+// canonicalizeUFO creates the canonical form by zeroing Signature+Node
 func canonicalizeUFO(u UserFileObject) ([]byte, error) {
 	tmp := u
 	tmp.Signature = nil
-	tmp.NodeDummy = uuid.Nil
+	tmp.Node = uuid.Nil
 
 	return json.Marshal(tmp)
 }
@@ -369,10 +376,10 @@ func verifyUFO(u *UserFileObject) error {
 		return errors.New("verifyUFO: owner's DS pubkey missing")
 	}
 
-	// Canonical form: signature removed, NodeDummy removed
+	// Canonical form: signature removed, Node removed
 	tmp := *u
 	tmp.Signature = nil
-	tmp.NodeDummy = uuid.Nil
+	tmp.Node = uuid.Nil
 
 	canon, err := json.Marshal(tmp)
 	if err != nil {
@@ -385,6 +392,17 @@ func verifyUFO(u *UserFileObject) error {
 
 	return nil
 }
+
+// Derives a deterministic UUID for invitation metadata from K and invitation UUID.
+func invitationMetaUUID(K []byte, inv uuid.UUID) (uuid.UUID, error) {
+	out, err := userlib.HashKDF(K, []byte("inv-meta|"+inv.String()))
+	if err != nil || len(out) < 16 {
+		return uuid.Nil, errors.New("invitationMetaUUID: failed to derive uuid")
+	}
+	return uuid.FromBytes(out[:16])
+}
+
+// { USER FUNCTIONS }
 
 func InitUser(username string, password string) (*User, error) {
 
@@ -663,12 +681,12 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 		return err
 	}
 
-	// Create OwnershipNode root
+	// Create NodeUFO root
 	rootNodeUUID := uuid.New()
-	ownerRoot := OwnershipNode{
+	ownerRoot := NodeUFO{
 		Username:           userdata.Username,
 		UserFileObjectUUID: uuid.Nil, // we fill after UFO is known
-		Children:           []OwnershipNode{},
+		Children:           []NodeUFO{},
 	}
 
 	// Build UFO
@@ -676,7 +694,7 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 	ufo := UserFileObject{
 		HeadDummy: headDummyUUID,
 		TailDummy: tailDummyUUID,
-		NodeDummy: rootNodeUUID,
+		Node: rootNodeUUID,
 		Owner:     userdata.Username,
 		Signature: nil,
 	}
@@ -852,42 +870,192 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	invitationPtr uuid.UUID, err error) {
 
 	// Check non empty filename and recipient username.
+	if len(filename) == 0 {
+		return uuid.Nil, errors.New("CreateInvitation: empty filename")
+	}
+
+	if len(recipientUsername) == 0 {
+		return uuid.Nil, errors.New("CreateInvitation: empty recipientUsername")
+	}
 
 	// Load and decrypt anchor of file to share
+	anchorUUID, err := fileAnchorUUID(userdata.SK, filename)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	var anchor DummyPointer
+	if err := loadDecryptedAt(anchorUUID, userdata.SK, &anchor); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: Could not load file anchor")
+	}
 
 	// Load and decrypt FileRoot
+	var root FileRoot
+	if err := loadFileRoot(userdata.PrivateKey, anchor.Address, &root); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: Could not load file root")
+	}
 
-	// Load UFO and verify integrity (owner's DS signature).
+	K := root.FileKey
+	ufoUUID := root.UFOUUID
 
-	// Load ownership tree from ufo.NodeDummy.
+	// Load own UFO and verify integrity (owner's DS signature).
+	var ufo UserFileObject
+	if err := loadDecryptedAt(ufoUUID, K, &ufo); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: coould not load UFO")
+	}
 
-	// Append child node for the recipient under the sharer's node.
+	if err := verifyUFO(&ufo); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: Could not verify UFO")
+	}
 
-	// Store updated ownership tree.
+	// Load our own NodeUFO from ufo.Node.
+	var nodeUFO NodeUFO
+	if err := loadDecryptedAt(ufo.Node, K, &nodeUFO); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to load nodeUFO")
+	}
 
-	// Look up recipient's public key to encrypt their fileRoot and make sure recpient exists.
+	// Get recipients public key, if it doesn't exist return error.
+	recipientPub, ok := userlib.KeystoreGet(recipientUsername)
+	if !ok {
+		return uuid.Nil, errors.New("CreateInvitation: recipient not found in keystore")
+	}
 
-	// Create FileRoot for the recipient and store it under a fresh UUID.
+	//Create UUID for recipient UFO (Needed to create their UFO)
+	recipientUFOUUID := uuid.New()
 
-	// Store in random UUID fileRoot
+	// Create root node for recipient (childNode)
+	childNode := NodeUFO{
+		Username:           recipientUsername,
+		UserFileObjectUUID: recipientUFOUUID,
+		Children:           []NodeUFO{},
+	}
 
-	return uuid.UUID{} , nil
+	childNodeUUID := uuid.New()
+	childNodeBytes, err := json.Marshal(childNode)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: Failed to Marshal childNode")
+	}
+	if err := storeEncryptedAt(childNodeUUID, K, childNodeBytes); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: Failed to store childNode")
+	}
+
+	// Create recipients UFO
+	recipientUFO := ufo
+	recipientUFO.Node = childNodeUUID
+	recipientUFOBytes, err := json.Marshal(recipientUFO)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed marshal recipientUFO")
+	}
+	if err := storeEncryptedAt(recipientUFOUUID, K, recipientUFOBytes); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to store recipient UFO")
+	}
+
+	// Store child node in own tree. Restore our updated nodeUFO in datastore.
+	nodeUFO.Children = append(nodeUFO.Children, childNode)
+	nodeUFOBytes, err := json.Marshal(nodeUFO)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to store updated nodeUFO")
+	}
+	if err := storeEncryptedAt(ufo.Node, K, nodeUFOBytes); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to store nodeUFO")
+	}
+
+	// Create recipients invitation UUID (THEIR file root UUID)
+	invitationUUID := uuid.New()
+
+	// Create recipients FileRoot
+	shareRoot := FileRoot{
+		UFOUUID: recipientUFOUUID,
+		FileKey: K,
+	}
+	if err := storeFileRoot(recipientPub, invitationUUID, &shareRoot); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to store invitation FileRoot")
+	}
+
+	// Create inviatation metadata object. At deterministic location.
+	metaUUID, err := invitationMetaUUID(K, invitationUUID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	meta := InvitationMetadata{Used: false}
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to marshal invitation metadata")
+	}
+
+	if err := storeEncryptedAt(metaUUID, K, metaBytes); err != nil {
+		return uuid.Nil, errors.New("CreateInvitation: failed to store invitation metadata")
+	}
+
+	// Return the invitation pointer UUID.
+	return invitationUUID, nil
 }
 
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
-	// Ensure filename length is nonzero
+	// Ensure filename length is nonzero and filename not already taken.
+	if len(filename) == 0 {
+		return errors.New("AcceptInvitation: empty filename")
+	}
+	anchorUUID, err := fileAnchorUUID(userdata.SK, filename)
+	if err != nil {
+		return err
+	}
+	if _, exists := userlib.DatastoreGet(anchorUUID); exists {
+		return errors.New("AcceptInvitation: filename already exists")
+	}
 
-	// Ensure recipient does not already have this filename.
+	// Load FileRoot from invitationPtr with out private key
+	var root FileRoot
+	if err := loadFileRoot(userdata.PrivateKey, invitationPtr, &root); err != nil {
+		return errors.New("AcceptInvitation: invalid invitation")
+	}
 
-	// Decrypt FileRoot from the invitation pointer using recipient's private key.
+	K := root.FileKey
+	recipientUFOUUID := root.UFOUUID
 
-	// Load UFO and verify integrity.
+	// Load UFO and test integrity
 
-	// Check Insert your own node in ownershipTree (Your own subtree)
+	var recipientUFO UserFileObject
+	if err := loadDecryptedAt(recipientUFOUUID, K, &recipientUFO); err != nil {
+		return errors.New("AcceptInvitation: UFO load failed")
+	}
 
-	// Create anchor from name to fileRoot
+	if err := verifyUFO(&recipientUFO); err != nil {
+		return errors.New("AcceptInvitation: UFO integrity check failed")
+	}
 
-	
+	// Get deterministic InvitationMetadata, and signal invitation has been used.
+
+	metaUUID, err := invitationMetaUUID(K, invitationPtr)
+	if err != nil {
+		return err
+	}
+
+	var meta InvitationMetadata
+	if err := loadDecryptedAt(metaUUID, K, &meta); err != nil {
+		return errors.New("AcceptInvitation: invitation metadata missing or corrupted")
+	}
+
+	if meta.Used {
+		return errors.New("AcceptInvitation: invitation already used")
+	}
+
+	// Mark as used
+	meta.Used = true
+	metaBytes, _ := json.Marshal(meta)
+	if err := storeEncryptedAt(metaUUID, K, metaBytes); err != nil {
+		return errors.New("AcceptInvitation: failed to update invitation metadata")
+	}
+
+	// Create anchor for filename
+	anchor := DummyPointer{Address: invitationPtr}
+	anchorBytes, _ := json.Marshal(anchor)
+
+	if err := storeEncryptedAt(anchorUUID, userdata.SK, anchorBytes); err != nil {
+		return errors.New("AcceptInvitation: failed to store anchor for recipient")
+	}
+
 	return nil
 }
 
