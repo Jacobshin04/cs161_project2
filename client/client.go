@@ -109,10 +109,12 @@ func someUsefulThings() {
 // A Go struct is like a Python or Java class - it can have attributes
 // (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
 type User struct {
-	Username   string
-	SK         []byte
-	PrivateKey userlib.PKEDecKey
-	PublicKey  userlib.PKEEncKey
+	Username     string
+	SK           []byte
+	PrivateKey   userlib.PKEDecKey
+	PublicKey    userlib.PKEEncKey
+	DSPublicKey  userlib.DSVerifyKey
+	DSPrivateKey userlib.DSSignKey
 
 	// You can add other attributes here if you want! But note that in order for attributes to
 	// be included when this struct is serialized to/from JSON, they must be capitalized.
@@ -122,7 +124,7 @@ type User struct {
 	// begins with a lowercase letter).
 }
 
-// EncryptedBlob definition
+// { HELPER STRUCTS }
 type EncryptedBlob struct {
 	IV         []byte
 	Ciphertext []byte
@@ -130,12 +132,18 @@ type EncryptedBlob struct {
 }
 
 type UserObject struct {
-	SaltUUID       uuid.UUID
-	PrivateKeyUUID uuid.UUID
+	SaltUUID         uuid.UUID
+	PrivateKeyUUID   uuid.UUID
+	DSPrivateKeyUUID uuid.UUID
 }
 
 type DummyPointer struct {
 	Address uuid.UUID
+}
+
+type FileRoot struct {
+	UFOUUID uuid.UUID
+	FileKey []byte
 }
 
 type FileContentNode struct {
@@ -146,9 +154,9 @@ type FileContentNode struct {
 type UserFileObject struct {
 	HeadDummy uuid.UUID
 	TailDummy uuid.UUID
-	TreeDummy uuid.UUID
-	FileKey   []byte
+	NodeDummy uuid.UUID
 	Owner     string
+	Signature []byte
 }
 
 type OwnershipNode struct {
@@ -157,9 +165,7 @@ type OwnershipNode struct {
 	Children           []OwnershipNode
 }
 
-// =====================
-// Helper Functions
-// =====================
+// { HELPER FUNCTIONS }
 
 // Given Symmetric K, IV and Plaintext returns Encrypted Blob
 func EncAndMac(K []byte, IV []byte, message []byte) (blob EncryptedBlob, err error) {
@@ -265,7 +271,8 @@ func storeEncryptedAt(uuidKey uuid.UUID, key []byte, plaintext []byte) error {
 	userlib.DatastoreSet(uuidKey, b)
 	return nil
 }
-// Given UUID, Key and Pointer to obejct, MacAndDec EncryptedBlob and stores in pointer 
+
+// Given UUID, Key and Pointer to object, MacAndDec EncryptedBlob and stores in pointer
 func loadDecryptedAt(uuidKey uuid.UUID, key []byte, out interface{}) error {
 	b, ok := userlib.DatastoreGet(uuidKey)
 	if !ok {
@@ -297,237 +304,274 @@ func readFileFromHead(head uuid.UUID, K []byte) ([]byte, error) {
 	return total, nil
 }
 
-// =====================
-// User Functions
-// =====================
+// Loads FileRoot given UUID and private key.
+func loadFileRoot(priv userlib.PKEDecKey, rootUUID uuid.UUID, rootOut *FileRoot) error {
+	ciphertext, ok := userlib.DatastoreGet(rootUUID)
+	if !ok {
+		return errors.New("loadFileRoot: FileRoot not found in datastore")
+	}
+	plaintext, err := userlib.PKEDec(priv, ciphertext)
+	if err != nil {
+		return errors.New("loadFileRoot: couldn't decrypt FileRoot with priv")
+	}
+	if err := json.Unmarshal(plaintext, rootOut); err != nil {
+		return errors.New("loadFileRoot: not a valid FileRoot")
+	}
+	return nil
+}
 
-func InitUser(username string, password string) (userdataptr *User, err error) {
-	// Check length username nonzero
+// Stores FileRoot using public-key encryption.
+func storeFileRoot(pub userlib.PKEEncKey, rootUUID uuid.UUID, root *FileRoot) error {
+	rootBytes, err := json.Marshal(root)
+	if err != nil {
+		return errors.New("storeFileRoot: failed to marshal FileRoot")
+	}
+	cipher, err := userlib.PKEEnc(pub, rootBytes)
+	if err != nil {
+		return errors.New("storeFileRoot: PKE encryption of FileRoot failed")
+	}
+	userlib.DatastoreSet(rootUUID, cipher)
+	return nil
+}
+
+// canonicalizeUFO creates the canonical form by zeroing Signature+NodeDummy
+func canonicalizeUFO(u UserFileObject) ([]byte, error) {
+	tmp := u
+	tmp.Signature = nil
+	tmp.NodeDummy = uuid.Nil
+
+	return json.Marshal(tmp)
+}
+
+// signUFO signs the canonical UFO using DS private key
+func signUFO(u *UserFileObject, priv userlib.DSSignKey) error {
+	canon, err := canonicalizeUFO(*u)
+	if err != nil {
+		return err
+	}
+	sig, err := userlib.DSSign(priv, canon)
+	if err != nil {
+		return err
+	}
+	u.Signature = sig
+	return nil
+}
+
+// verifyUFO checks signature correctness
+func verifyUFO(u *UserFileObject) error {
+	if u.Owner == "" {
+		return errors.New("verifyUFO: missing owner")
+	}
+
+	// Fetch owner's signature public key
+	dsPub, ok := userlib.KeystoreGet(u.Owner + "|DS")
+	if !ok {
+		return errors.New("verifyUFO: owner's DS pubkey missing")
+	}
+
+	// Canonical form: signature removed, NodeDummy removed
+	tmp := *u
+	tmp.Signature = nil
+	tmp.NodeDummy = uuid.Nil
+
+	canon, err := json.Marshal(tmp)
+	if err != nil {
+		return errors.New("verifyUFO: canonical marshal failed")
+	}
+
+	if err := userlib.DSVerify(dsPub, canon, u.Signature); err != nil {
+		return errors.New("verifyUFO: signature invalid")
+	}
+
+	return nil
+}
+
+func InitUser(username string, password string) (*User, error) {
+
 	if len(username) == 0 {
 		return nil, errors.New("InitUser: username cannot be empty")
 	}
 
-	// Map username to determinitstic uuid
-	userUUID, e := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
-	if e != nil {
-		return nil, errors.New("InitUser: failed to derive user UUID from username")
-	}
-
-	// Make sure username doesn't exist yet
-	if _, exists := userlib.DatastoreGet(userUUID); exists {
-		return nil, fmt.Errorf("InitUser: username %q already exists", username)
-	}
-
-	// generate UUIDs for location of salt, privateKey and userObject
-	saltUUID := uuid.New()
-	privateKeyUUID := uuid.New()
-	userObjectIV := uuid.New()
-
-	// userObject points to salt and privateKey pointers
-	userObject := UserObject{
-		SaltUUID:       saltUUID,
-		PrivateKeyUUID: privateKeyUUID,
-	}
-
-	userObjectBytes, err := json.Marshal(userObject)
-	if err != nil {
-		return nil, errors.New("InitUser: error while Marshal userObject")
-	}
-
-	// derive key K from password. HashKDF K and split into k1 and k2
-	K := userlib.Hash([]byte(password))
-
-	KDFOutput, err := userlib.HashKDF(K[:16], []byte("key one"))
-	if err != nil {
-		return nil, errors.New("InitUser: key derivation failed")
-	}
-	if len(KDFOutput) < 32 {
-		return nil, errors.New("InitUser: insufficient KDF output length")
-	}
-	K1 := KDFOutput[:16]   // root key for userObject blob
-	K2 := KDFOutput[16:32] // root key for salt blob
-
-	// encrypt userObject with K1 and store under userUUID
-	encUserBlob, err := EncAndMac(K1, userObjectIV[:], userObjectBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	encUserBytes, err := json.Marshal(encUserBlob)
-	if err != nil {
-		return nil, errors.New("InitUser: error while marshaling encrypted user object")
-	}
-
-	userlib.DatastoreSet(userUUID, encUserBytes)
-
-	// generate salt, encrypt it with K2, and store under saltUUID
-	salt := uuid.New()
-	saltIV := uuid.New() // IV for salt
-
-	encSaltBlob, err := EncAndMac(K2, saltIV[:], salt[:16])
-	if err != nil {
-		return nil, err
-	}
-
-	encSaltBytes, err := json.Marshal(encSaltBlob)
-	if err != nil {
-		return nil, errors.New("InitUser: error while marshaling encrypted salt")
-	}
-
-	userlib.DatastoreSet(saltUUID, encSaltBytes)
-
-	// Slow hash SK from password and salt
-	SK, err := slowHash([]byte(password), salt[:16])
-	if err != nil {
-		return nil, err
-	}
-
-	// generate keypair and put public key in Keystore username -> key
-	publicKey, privateKey, err := userlib.PKEKeyGen()
-	if err != nil {
-		return nil, err
-	}
-
-	userlib.KeystoreSet(username, publicKey)
-
-	// Encrypt private key with SK and store under privateKeyUUID
-	privateKeyIV := uuid.New()
-
-	// key to bytes before encryption
-	privBytes, err := json.Marshal(privateKey)
-	if err != nil {
-		return nil, errors.New("InitUser: failed to marshal private key")
-	}
-
-	encPrivBlob, err := EncAndMac(SK, privateKeyIV[:], privBytes)
-	if err != nil {
-		return nil, errors.New("InitUser: failed to encrypt then MAC private key")
-	}
-
-	encPrivBytes, err := json.Marshal(encPrivBlob)
-	if err != nil {
-		return nil, errors.New("InitUser: failed to marshal encrypted private key")
-	}
-
-	userlib.DatastoreSet(privateKeyUUID, encPrivBytes)
-
-	// Construct local user struct
-	user := &User{
-		Username:   username,
-		SK:         SK,
-		PrivateKey: privateKey,
-		PublicKey:  publicKey,
-	}
-
-	return user, nil
-}
-
-func GetUser(username string, password string) (userdataptr *User, err error) {
-	// Check length username nonzero
-	if len(username) == 0 {
-		return nil, errors.New("GetUser: username cannot be empty")
-	}
-
-	// Compute deterministic UUID for username
+	// Deterministic user UUID from Hash(username[:16])
 	userUUID, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
 	if err != nil {
-		return nil, errors.New("GetUser: failed to compute UUID for username")
+		return nil, errors.New("InitUser: cannot derive UUID")
 	}
 
-	// Make sure username exists
-	data, ok := userlib.DatastoreGet(userUUID)
+	// Check for no duplicate username
+	if _, exists := userlib.DatastoreGet(userUUID); exists {
+		return nil, errors.New("InitUser: username already exists")
+	}
+
+	// Generate pointer UUIDs for user metadata.
+	saltUUID := uuid.New()
+	privateKeyUUID := uuid.New()
+	dsPrivateKeyUUID := uuid.New()
+
+	// Build user object. User Object to be encrypted and mac'd under deterministic password derived key.
+	userMeta := UserObject{
+		SaltUUID:         saltUUID,
+		PrivateKeyUUID:   privateKeyUUID,
+		DSPrivateKeyUUID: dsPrivateKeyUUID,
+	}
+
+	userMetaBytes, err := json.Marshal(userMeta)
+	if err != nil {
+		return nil, errors.New("InitUser: failed to marshal user metadata")
+	}
+
+	// Derive basic key from password. K1 for User Object and K2 for salt encryption.
+	pwHash := userlib.Hash([]byte(password))
+	KDFOut, err := userlib.HashKDF(pwHash[:16], []byte("user-meta"))
+	if err != nil {
+		return nil, errors.New("InitUser: HashKDF failed")
+	}
+	if len(KDFOut) < 32 {
+		return nil, errors.New("InitUser: insufficient KDF output")
+	}
+	K1 := KDFOut[:16]   // key for userObject
+	K2 := KDFOut[16:32] // will be used for salt encryption
+
+	// Encrypt userMetaBytes under K1 and userUUID
+	if err := storeEncryptedAt(userUUID, K1, userMetaBytes); err != nil {
+		return nil, err
+	}
+
+	// Generate salt and encrypt under K2 and saltUUID.
+	saltBytes := userlib.RandomBytes(16)
+	saltJSON, err := json.Marshal(saltBytes)
+	if err != nil {
+		return nil, errors.New("InitUser: failed to marshal salt")
+	}
+	if err := storeEncryptedAt(saltUUID, K2, saltJSON); err != nil {
+		return nil, err
+	}
+
+	// Generate SK with slow hash using password and salt
+	SK, err := slowHash([]byte(password), saltBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate RSA PKE Encryption Key Pair to Encrypt and Decrypt File Roots for sharing.
+	pkePub, pkePriv, err := userlib.PKEKeyGen()
+	if err != nil {
+		return nil, errors.New("InitUser: PKEKeyGen failed")
+	}
+	userlib.KeystoreSet(username, pkePub)
+
+	// Generate RSA DS Key Pair to have certified ownership of files.
+	dsPriv, dsPub, err := userlib.DSKeyGen()
+	if err != nil {
+		return nil, errors.New("InitUser: DSKeyGen failed")
+	}
+	userlib.KeystoreSet(username+"|DS", dsPub)
+
+	// Encrypt PKE private key under SK
+	privBytes, _ := json.Marshal(pkePriv)
+	storeEncryptedAt(privateKeyUUID, SK, privBytes)
+
+	// Encrypt DS private key under SK
+	dsPrivBytes, _ := json.Marshal(dsPriv)
+	storeEncryptedAt(dsPrivateKeyUUID, SK, dsPrivBytes)
+
+	// Build local User struct
+	u := &User{
+		Username:     username,
+		SK:           SK,
+		PublicKey:    pkePub,
+		PrivateKey:   pkePriv,
+		DSPublicKey:  dsPub,
+		DSPrivateKey: dsPriv,
+	}
+
+	return u, nil
+}
+
+func GetUser(username string, password string) (*User, error) {
+
+	if len(username) == 0 {
+		return nil, errors.New("GetUser: empty username")
+	}
+
+	userUUID, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+	if err != nil {
+		return nil, errors.New("GetUser: hash UUID failed")
+	}
+
+	// Check if user exists before proceeding
+	_, ok := userlib.DatastoreGet(userUUID)
 	if !ok {
-		return nil, errors.New("GetUser: user does not exist in datastore")
+		return nil, errors.New("GetUser: user does not exist")
 	}
 
-	// Derive key K
-	K := userlib.Hash([]byte(password))
-	KDF_output, err := userlib.HashKDF(K[:16], []byte("key one"))
+	// Derive password based keys
+	pwHash := userlib.Hash([]byte(password))
+	KDFOut, err := userlib.HashKDF(pwHash[:16], []byte("user-meta"))
 	if err != nil {
-		return nil, errors.New("GetUser: HashKDF failed for password")
+		return nil, errors.New("GetUser: HashKDF failed")
 	}
-	if len(KDF_output) < 32 {
-		return nil, errors.New("GetUser: insufficient KDF output length")
+	if len(KDFOut) < 32 {
+		return nil, errors.New("GetUser: insufficient KDF out")
 	}
-	K1 := KDF_output[:16]
-	K2 := KDF_output[16:32]
+	K1 := KDFOut[:16]
+	K2 := KDFOut[16:32]
 
-	// Unmarshal and decrypt user metadata
-	var userRecord EncryptedBlob
-	if err := json.Unmarshal(data, &userRecord); err != nil {
-		return nil, errors.New("GetUser: failed to unmarshal user record blob")
-	}
+	// Load and decrypt user metadata
 
-	decryptedUserStruct, err := MacAndDec(K1, userRecord)
-	if err != nil {
-		return nil, errors.New("GetUser: user struct MAC check failed or password incorrect")
+	var meta UserObject
+	if err := loadDecryptedAt(userUUID, K1, &meta); err != nil {
+		return nil, errors.New("GetUser: Incorrect password (Failed to decrypt metadata)")
 	}
 
-	var userStruct UserObject
-	if err := json.Unmarshal(decryptedUserStruct, &userStruct); err != nil {
-		return nil, errors.New("GetUser: malformed user metadata after decryption")
+	// Load saltBytes
+	var saltBytes []byte
+	if err := loadDecryptedAt(meta.SaltUUID, K2, &saltBytes); err != nil {
+		return nil, errors.New("GetUser: Incorrect password (Failed to decrypt Salt)")
 	}
 
-	// Load and decrypt salt
-	saltBlobBytes, ok := userlib.DatastoreGet(userStruct.SaltUUID)
-	if !ok {
-		return nil, errors.New("GetUser: salt not found in datastore")
-	}
-
-	var saltBlob EncryptedBlob
-	if err := json.Unmarshal(saltBlobBytes, &saltBlob); err != nil {
-		return nil, errors.New("GetUser: malformed salt encrypted blob")
-	}
-
-	saltBytes, err := MacAndDec(K2, saltBlob)
-	if err != nil {
-		return nil, errors.New("GetUser: salt MAC check failed or password incorrect")
-	}
-
-	// Slow hash to derive SK
+	// Recompute SK
 	SK, err := slowHash([]byte(password), saltBytes)
 	if err != nil {
 		return nil, errors.New("GetUser: slowHash failed")
 	}
 
-	// Load and decrypt private key
-	privateKeyBlobBytes, ok := userlib.DatastoreGet(userStruct.PrivateKeyUUID)
+	// Load PKE private key from Datastore, Load PKE public key from Keystore
+	var pkePriv userlib.PKEDecKey
+	if err := loadDecryptedAt(meta.PrivateKeyUUID, SK, &pkePriv); err != nil {
+		return nil, errors.New("GetUser: Failed to derive SK")
+	}
+
+	pubKey, ok := userlib.KeystoreGet(username)
 	if !ok {
-		return nil, errors.New("GetUser: private key not found in datastore")
+		return nil, errors.New("GetUser: PKE public key missing")
 	}
 
-	var privateKeyBlob EncryptedBlob
-	if err := json.Unmarshal(privateKeyBlobBytes, &privateKeyBlob); err != nil {
-		return nil, errors.New("GetUser: malformed encrypted private key blob")
+	// Load DS private key from datastore, Load DS public key from keystore
+	var dsPriv userlib.DSSignKey
+	if err := loadDecryptedAt(meta.DSPrivateKeyUUID, SK, &dsPriv); err != nil {
+		return nil, errors.New("GetUser: Failed to derive SK (couldn't load dpriv)")
 	}
 
-	privateKeyBytes, err := MacAndDec(SK, privateKeyBlob)
-	if err != nil {
-		return nil, errors.New("GetUser: private key MAC check failed or password incorrect")
-	}
-
-	var privateKey userlib.PKEDecKey
-	if err := json.Unmarshal(privateKeyBytes, &privateKey); err != nil {
-		return nil, errors.New("GetUser: private key could not be unmarshaled")
-	}
-
-	// Load public key from keystore
-	publicKey, ok := userlib.KeystoreGet(username)
+	dsPub, ok := userlib.KeystoreGet(username + "|DS")
 	if !ok {
-		return nil, errors.New("GetUser: public key not found in keystore")
+		return nil, errors.New("GetUser: DS public key missing")
 	}
 
-	// Construct and return user struct
-	returnUser := &User{
-		Username:   username,
-		SK:         SK,
-		PrivateKey: privateKey,
-		PublicKey:  publicKey,
+	// Build User struct
+	u := &User{
+		Username:     username,
+		SK:           SK,
+		PublicKey:    pubKey,
+		PrivateKey:   pkePriv,
+		DSPublicKey:  dsPub,
+		DSPrivateKey: dsPriv,
 	}
-	return returnUser, nil
+
+	return u, nil
 }
 
-func (userdata *User) StoreFile(filename string, content []byte) (err error) {
+func (userdata *User) StoreFile(filename string, content []byte) error {
 	if len(filename) == 0 {
 		return errors.New("StoreFile: empty filename")
 	}
@@ -537,27 +581,36 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return err
 	}
 
-	// If anchor exists, overwrite Head and Dummy nodes to point to new FileContentNode
-	if anchorBytes, ok := userlib.DatastoreGet(anchorUUID); ok {
-		var anchorBlob EncryptedBlob
-		if err := json.Unmarshal(anchorBytes, &anchorBlob); err != nil {
-			return errors.New("StoreFile: malformed anchor")
-		}
-		anchorPT, err := MacAndDec(userdata.SK, anchorBlob)
-		if err != nil {
-			return errors.New("StoreFile: anchor integrity failed")
-		}
+	// If file exists overwrite
+	if _, exists := userlib.DatastoreGet(anchorUUID); exists {
+
+		// load anchor
 		var anchor DummyPointer
-		if err := json.Unmarshal(anchorPT, &anchor); err != nil {
-			return errors.New("StoreFile: anchor decode failed")
+		if err := loadDecryptedAt(anchorUUID, userdata.SK, &anchor); err != nil {
+			return errors.New("StoreFile: corrupted anchor (overwrite)")
 		}
 
+		// load FileRoot
+		var root FileRoot
+		if err := loadFileRoot(userdata.PrivateKey, anchor.Address, &root); err != nil {
+			return errors.New("StoreFile: FileRoot load fail (overwrite)")
+		}
+
+		K := root.FileKey
+		ufoUUID := root.UFOUUID
+
+		// load UFO
 		var ufo UserFileObject
-		if err := loadDecryptedAt(anchor.Address, userdata.SK, &ufo); err != nil {
-			return errors.New("StoreFile: UFO load failed")
+		if err := loadDecryptedAt(ufoUUID, K, &ufo); err != nil {
+			return errors.New("StoreFile: UFO corrupted (overwrite)")
 		}
 
-		K := ufo.FileKey
+		// verify signature
+		if err := verifyUFO(&ufo); err != nil {
+			return errors.New("StoreFile: signature invalid (overwrite)")
+		}
+
+		// overwrite content by creating new single node
 		newNodeUUID := uuid.New()
 		node := FileContentNode{Content: content, Next: uuid.Nil}
 		nodeBytes, _ := json.Marshal(node)
@@ -565,89 +618,103 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 			return err
 		}
 
+		// update head/tail dummies
 		headDummy := DummyPointer{Address: newNodeUUID}
 		tailDummy := DummyPointer{Address: newNodeUUID}
-		hdBytes, _ := json.Marshal(headDummy)
-		tdBytes, _ := json.Marshal(tailDummy)
+		headDummyBytes, _ := json.Marshal(headDummy)
+		tailDummyBytes, _ := json.Marshal(tailDummy)
 
-		if err := storeEncryptedAt(ufo.HeadDummy, K, hdBytes); err != nil {
+		if err := storeEncryptedAt(ufo.HeadDummy, K, headDummyBytes); err != nil {
 			return err
 		}
-		if err := storeEncryptedAt(ufo.TailDummy, K, tdBytes); err != nil {
+		if err := storeEncryptedAt(ufo.TailDummy, K, tailDummyBytes); err != nil {
 			return err
 		}
+
 		return nil
 	}
 
-	// New Key K for file.
+	// File doesn't exist, Create new one.
+
+	// New random file key
 	K := userlib.RandomBytes(16)
 
-	// Create new NodeUUID make it point to enc FileContentNode with K
+	// Create content node
 	nodeUUID := uuid.New()
 	node := FileContentNode{Content: content, Next: uuid.Nil}
+
 	nodeBytes, _ := json.Marshal(node)
 	if err := storeEncryptedAt(nodeUUID, K, nodeBytes); err != nil {
-		return err
+		return errors.New("StoreFile: store node fail")
 	}
 
-	// Create Head and Tail dummmies to point to new NodeUUID and store them.
+	// Create Head/Tail dummies
 	headDummyUUID := uuid.New()
 	tailDummyUUID := uuid.New()
 	headDummy := DummyPointer{Address: nodeUUID}
 	tailDummy := DummyPointer{Address: nodeUUID}
-	hdBytes, _ := json.Marshal(headDummy)
-	tdBytes, _ := json.Marshal(tailDummy)
-	if err := storeEncryptedAt(headDummyUUID, K, hdBytes); err != nil {
+	headDummyBytes, _ := json.Marshal(headDummy)
+	tailDummyBytes, _ := json.Marshal(tailDummy)
+
+	if err := storeEncryptedAt(headDummyUUID, K, headDummyBytes); err != nil {
 		return err
 	}
-	if err := storeEncryptedAt(tailDummyUUID, K, tdBytes); err != nil {
+	if err := storeEncryptedAt(tailDummyUUID, K, tailDummyBytes); err != nil {
 		return err
 	}
 
-	// Init OwnershipTree root and TreeDummy
-	treeUUID := uuid.New()
-	treeDummyUUID := uuid.New()
-	root := OwnershipNode{
+	// Create OwnershipNode root
+	rootNodeUUID := uuid.New()
+	ownerRoot := OwnershipNode{
 		Username:           userdata.Username,
-		UserFileObjectUUID: uuid.Nil,
+		UserFileObjectUUID: uuid.Nil, // we fill after UFO is known
 		Children:           []OwnershipNode{},
 	}
-	rootBytes, _ := json.Marshal(root)
-	if err := storeEncryptedAt(treeUUID, K, rootBytes); err != nil {
-		return err
-	}
-	treeDummy := DummyPointer{Address: treeUUID}
-	treeDummyBytes, _ := json.Marshal(treeDummy)
-	if err := storeEncryptedAt(treeDummyUUID, K, treeDummyBytes); err != nil {
-		return err
-	}
 
-	// UserFileObject.
+	// Build UFO
 	ufoUUID := uuid.New()
 	ufo := UserFileObject{
 		HeadDummy: headDummyUUID,
 		TailDummy: tailDummyUUID,
-		TreeDummy: treeDummyUUID,
-		FileKey:   K,
+		NodeDummy: rootNodeUUID,
 		Owner:     userdata.Username,
+		Signature: nil,
 	}
+
+	// Sign UFO
+	if err := signUFO(&ufo, userdata.DSPrivateKey); err != nil {
+		return errors.New("StoreFile: signing failed")
+	}
+
+	// store UFO
 	ufoBytes, _ := json.Marshal(ufo)
-	if err := storeEncryptedAt(ufoUUID, userdata.SK, ufoBytes); err != nil {
-		return err
+	if err := storeEncryptedAt(ufoUUID, K, ufoBytes); err != nil {
+		return errors.New("StoreFile: storing UFO failed")
 	}
 
-	// Fix root to point to owner UFO.
-	root.UserFileObjectUUID = ufoUUID
-	rootBytes2, _ := json.Marshal(root)
-	if err := storeEncryptedAt(treeUUID, K, rootBytes2); err != nil {
-		return err
+	// now store ownership node with correct UFO UUID
+	ownerRoot.UserFileObjectUUID = ufoUUID
+	ownBytes, _ := json.Marshal(ownerRoot)
+	if err := storeEncryptedAt(rootNodeUUID, K, ownBytes); err != nil {
+		return errors.New("StoreFile: store ownership node fail")
 	}
 
-	// Anchor dummy.
-	anchor := DummyPointer{Address: ufoUUID}
+	// Build FileRoot, Encrypt with Public key. Integrity protected by signature inside UFO
+	fileRootUUID := uuid.New()
+	fileRoot := FileRoot{
+		UFOUUID: ufoUUID,
+		FileKey: K,
+	}
+
+	if err := storeFileRoot(userdata.PublicKey, fileRootUUID, &fileRoot); err != nil {
+		return errors.New("StoreFile: storing FileRoot failed")
+	}
+
+	// anchor with SK
+	anchor := DummyPointer{Address: fileRootUUID}
 	anchorBytes, _ := json.Marshal(anchor)
 	if err := storeEncryptedAt(anchorUUID, userdata.SK, anchorBytes); err != nil {
-		return err
+		return errors.New("StoreFile: storing anchor failed")
 	}
 
 	return nil
@@ -658,62 +725,79 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 		return errors.New("AppendToFile: empty filename")
 	}
 
-	// Get Anchor
 	anchorUUID, err := fileAnchorUUID(userdata.SK, filename)
 	if err != nil {
 		return err
 	}
 
+	// load anchor
 	var anchor DummyPointer
 	if err := loadDecryptedAt(anchorUUID, userdata.SK, &anchor); err != nil {
-		return errors.New("AppendToFile: anchor missing or corrupted")
+		return errors.New("AppendToFile: anchor corrupted")
 	}
 
-	// Get UserFileObject from Anchor
+	// load FileRoot
+	var root FileRoot
+	if err := loadFileRoot(userdata.PrivateKey, anchor.Address, &root); err != nil {
+		return errors.New("AppendToFile: FileRoot corrupted")
+	}
+
+	K := root.FileKey
+	ufoUUID := root.UFOUUID
+
+	// load UFO
 	var ufo UserFileObject
-	if err := loadDecryptedAt(anchor.Address, userdata.SK, &ufo); err != nil {
-		return errors.New("AppendToFile: UFO load failed")
+	if err := loadDecryptedAt(ufoUUID, K, &ufo); err != nil {
+		return errors.New("AppendToFile: UFO corrupted")
 	}
 
-	// Get Key, Go get Tail Object
-	K := ufo.FileKey
+	// verify signature
+	if err := verifyUFO(&ufo); err != nil {
+		return errors.New("AppendToFile: signature invalid")
+	}
 
+	// load tail dummy
 	var tailDummy DummyPointer
 	if err := loadDecryptedAt(ufo.TailDummy, K, &tailDummy); err != nil {
 		return errors.New("AppendToFile: tail dummy corrupted")
 	}
+
 	oldTailUUID := tailDummy.Address
 
-	// New node.
+	// create new node
 	newNodeUUID := uuid.New()
-	newNode := FileContentNode{Content: content, Next: uuid.Nil}
+	newNode := FileContentNode{
+		Content: content,
+		Next:    uuid.Nil,
+	}
 	newNodeBytes, _ := json.Marshal(newNode)
 	if err := storeEncryptedAt(newNodeUUID, K, newNodeBytes); err != nil {
-		return err
+		return errors.New("AppendToFile: storing new node failed")
 	}
 
-	// Update old tail.
+	// Patch old tail
 	var oldTail FileContentNode
 	if err := loadDecryptedAt(oldTailUUID, K, &oldTail); err != nil {
 		return errors.New("AppendToFile: old tail corrupted")
 	}
 	oldTail.Next = newNodeUUID
-	oldTailBytes, _ := json.Marshal(oldTail)
-	if err := storeEncryptedAt(oldTailUUID, K, oldTailBytes); err != nil {
-		return err
+
+	patched, _ := json.Marshal(oldTail)
+	if err := storeEncryptedAt(oldTailUUID, K, patched); err != nil {
+		return errors.New("AppendToFile: updating old tail failed")
 	}
 
-	// Update tail dummy.
+	// Update tail dummy
 	tailDummy.Address = newNodeUUID
 	tailDummyBytes, _ := json.Marshal(tailDummy)
 	if err := storeEncryptedAt(ufo.TailDummy, K, tailDummyBytes); err != nil {
-		return err
+		return errors.New("AppendToFile: updating tail dummy failed")
 	}
 
 	return nil
 }
 
-func (userdata *User) LoadFile(filename string) (content []byte, err error) {
+func (userdata *User) LoadFile(filename string) ([]byte, error) {
 	if len(filename) == 0 {
 		return nil, errors.New("LoadFile: empty filename")
 	}
@@ -723,37 +807,91 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
+	// load anchor
 	var anchor DummyPointer
 	if err := loadDecryptedAt(anchorUUID, userdata.SK, &anchor); err != nil {
 		return nil, errors.New("LoadFile: file not found")
 	}
 
+	// load FileRoot
+	var root FileRoot
+	if err := loadFileRoot(userdata.PrivateKey, anchor.Address, &root); err != nil {
+		return nil, errors.New("LoadFile: FileRoot corrupted")
+	}
+
+	K := root.FileKey
+	ufoUUID := root.UFOUUID
+
+	// load UFO
 	var ufo UserFileObject
-	if err := loadDecryptedAt(anchor.Address, userdata.SK, &ufo); err != nil {
+	if err := loadDecryptedAt(ufoUUID, K, &ufo); err != nil {
 		return nil, errors.New("LoadFile: UFO corrupted")
 	}
 
-	K := ufo.FileKey
+	// verify signature
+	if err := verifyUFO(&ufo); err != nil {
+		return nil, errors.New("LoadFile: signature invalid")
+	}
 
+	// load head dummy
 	var headDummy DummyPointer
 	if err := loadDecryptedAt(ufo.HeadDummy, K, &headDummy); err != nil {
 		return nil, errors.New("LoadFile: head dummy corrupted")
 	}
 
-	return readFileFromHead(headDummy.Address, K)
+	// read linked list
+	data, err := readFileFromHead(headDummy.Address, K)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
 }
 
 func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
 	invitationPtr uuid.UUID, err error) {
-		return 
 
+	// Check non empty filename and recipient username.
+
+	// Load and decrypt anchor of file to share
+
+	// Load and decrypt FileRoot
+
+	// Load UFO and verify integrity (owner's DS signature).
+
+	// Load ownership tree from ufo.NodeDummy.
+
+	// Append child node for the recipient under the sharer's node.
+
+	// Store updated ownership tree.
+
+	// Look up recipient's public key to encrypt their fileRoot and make sure recpient exists.
+
+	// Create FileRoot for the recipient and store it under a fresh UUID.
+
+	// Store in random UUID fileRoot
+
+	return uuid.UUID{} , nil
 }
 
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
+	// Ensure filename length is nonzero
 
+	// Ensure recipient does not already have this filename.
+
+	// Decrypt FileRoot from the invitation pointer using recipient's private key.
+
+	// Load UFO and verify integrity.
+
+	// Check Insert your own node in ownershipTree (Your own subtree)
+
+	// Create anchor from name to fileRoot
+
+	
 	return nil
 }
 
 func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
+
 	return nil
 }
