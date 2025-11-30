@@ -150,7 +150,7 @@ type FileRoot struct {
 }
 
 type FileContentNode struct {
-	Content []byte
+	ContentUUID uuid.UUID
 	Next    uuid.UUID
 }
 
@@ -306,7 +306,11 @@ func readFileFromHead(head uuid.UUID, K []byte) ([]byte, error) {
 		if err := loadDecryptedAt(cur, K, &node); err != nil {
 			return nil, err
 		}
-		total = append(total, node.Content...)
+		content, err := loadBytesFrom(node.ContentUUID, K)
+		if err != nil {
+			return nil, errors.New("ReadFileFromHead: Failed to load content")
+		}
+		total = append(total, content...)
 		cur = node.Next
 	}
 	return total, nil
@@ -464,7 +468,24 @@ func tamperSubTree(K []byte, childSummary NodeUFO) error {
 
 }
 
-// Given NodeUFO root, rencrypts and moves contents of file. Helpful to update for protection on revocation.
+func storeBytesAt(id uuid.UUID, key []byte, data []byte) error {
+    dataJSON, err := json.Marshal(data)
+    if err != nil {
+        return err
+    }
+    return storeEncryptedAt(id, key, dataJSON)
+}
+
+func loadBytesFrom(id uuid.UUID, key []byte) ([]byte, error) {
+    var data []byte
+    if err := loadDecryptedAt(id, key, &data); err != nil {
+        return nil, err
+    }
+    return data, nil
+}
+
+// Given NodeUFO root and current key for File, rencrypts and moves contents of file to a new key. 
+// 	Updates everyone elses Helpful to update for protection on revocation.
 func reencryptTree(curr_K []byte, rootUFO NodeUFO) error {
 	return nil
 }
@@ -701,7 +722,11 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 
 		// overwrite content by creating new single node
 		newNodeUUID := uuid.New()
-		node := FileContentNode{Content: content, Next: uuid.Nil}
+		contentUUID := uuid.New()
+		if err := storeBytesAt(contentUUID, K, content); err != nil {
+			return errors.New("StoreFile: Failed to store content (overwrite)")
+		}
+		node := FileContentNode{ContentUUID: contentUUID, Next: uuid.Nil}
 		nodeBytes, _ := json.Marshal(node)
 		if err := storeEncryptedAt(newNodeUUID, K, nodeBytes); err != nil {
 			return err
@@ -730,7 +755,11 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 
 	// Create content node
 	nodeUUID := uuid.New()
-	node := FileContentNode{Content: content, Next: uuid.Nil}
+	contentUUID := uuid.New()
+	if err := storeBytesAt(contentUUID, K, content); err != nil {
+		return errors.New("StoreFile: failed to store content")
+	}
+	node := FileContentNode{ContentUUID: contentUUID, Next: uuid.Nil}
 
 	nodeBytes, _ := json.Marshal(node)
 	if err := storeEncryptedAt(nodeUUID, K, nodeBytes); err != nil {
@@ -856,8 +885,12 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 
 	// create new node
 	newNodeUUID := uuid.New()
+	contentUUID := uuid.New()
+	if err := storeBytesAt(contentUUID, K, content); err != nil {
+		return errors.New("AppendToFile: failed to store content")
+	}
 	newNode := FileContentNode{
-		Content: content,
+		ContentUUID: contentUUID,
 		Next:    uuid.Nil,
 	}
 	newNodeBytes, _ := json.Marshal(newNode)
