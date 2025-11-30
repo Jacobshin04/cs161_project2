@@ -157,7 +157,7 @@ type FileContentNode struct {
 type UserFileObject struct {
 	HeadDummy uuid.UUID
 	TailDummy uuid.UUID
-	Node uuid.UUID
+	Node      uuid.UUID
 	Owner     string
 	Signature []byte
 }
@@ -165,6 +165,7 @@ type UserFileObject struct {
 type NodeUFO struct {
 	Username           string
 	UserFileObjectUUID uuid.UUID
+	FileRootUUID       uuid.UUID
 	Children           []NodeUFO
 }
 
@@ -402,6 +403,72 @@ func invitationMetaUUID(K []byte, inv uuid.UUID) (uuid.UUID, error) {
 	return uuid.FromBytes(out[:16])
 }
 
+// Given NodeUFO root, tampers subtree. Helpful for revocation.
+func tamperSubTree(K []byte, childSummary NodeUFO) error {
+	// From that child, walk its sharing subtree and collect all nodes to revoke
+	var revokedNodes []NodeUFO
+
+	// We always traverse from each user's own NodeUFO
+	var dfs func(node NodeUFO) error
+	dfs = func(node NodeUFO) error {
+		revokedNodes = append(revokedNodes, node)
+
+		for _, ch := range node.Children {
+			// For each child summary, load their UFO to find their Node root, then recurse
+			var childUFO UserFileObject
+			if err := loadDecryptedAt(ch.UserFileObjectUUID, K, &childUFO); err != nil {
+				// If it's already corrupted add but don't go any deeper
+				revokedNodes = append(revokedNodes, ch)
+				continue
+			}
+
+			var childRoot NodeUFO
+			if err := loadDecryptedAt(childUFO.Node, K, &childRoot); err != nil {
+				// Same idea, mark child, skip its descendants if we can't read
+				revokedNodes = append(revokedNodes, ch)
+				continue
+			}
+
+			if err := dfs(childRoot); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Load the recipients own Node root via their UFO, then DFS
+	var childUFO UserFileObject
+	if err := loadDecryptedAt(childSummary.UserFileObjectUUID, K, &childUFO); err != nil {
+		return errors.New("RevokeAccess: failed to load child UFO")
+	}
+
+	var childRoot NodeUFO
+	if err := loadDecryptedAt(childUFO.Node, K, &childRoot); err != nil {
+		return errors.New("RevokeAccess: failed to load child ownership node")
+	}
+
+	if err := dfs(childRoot); err != nil {
+		return err
+	}
+
+	// Tamper all revoked users FileRoots, UFOs, and invitation metadata.
+	for _, n := range revokedNodes {
+		userlib.DatastoreSet(n.FileRootUUID, []byte{})
+		userlib.DatastoreSet(n.UserFileObjectUUID, []byte{})
+		if metaUUID, err := invitationMetaUUID(K, n.FileRootUUID); err == nil {
+			userlib.DatastoreSet(metaUUID, []byte{})
+		}
+	}
+
+	return nil
+
+}
+
+// Given NodeUFO root, rencrypts and moves contents of file. Helpful to update for protection on revocation.
+func reencryptTree(curr_K []byte, rootUFO NodeUFO) error {
+	return nil
+}
+
 // { USER FUNCTIONS }
 
 func InitUser(username string, password string) (*User, error) {
@@ -601,6 +668,10 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 
 	// If file exists overwrite
 	if _, exists := userlib.DatastoreGet(anchorUUID); exists {
+		// If file has been tampered don't overwrite.
+		if _, err := userdata.LoadFile(filename); err != nil {
+			return errors.New("StoreFile: existing file corrupted")
+		}
 
 		// load anchor
 		var anchor DummyPointer
@@ -683,9 +754,11 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 
 	// Create NodeUFO root
 	rootNodeUUID := uuid.New()
+	fileRootUUID := uuid.New() // WE NEED IT IN NodeUFO so we declare now Lol
 	ownerRoot := NodeUFO{
 		Username:           userdata.Username,
 		UserFileObjectUUID: uuid.Nil, // we fill after UFO is known
+		FileRootUUID:       fileRootUUID,
 		Children:           []NodeUFO{},
 	}
 
@@ -694,7 +767,7 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 	ufo := UserFileObject{
 		HeadDummy: headDummyUUID,
 		TailDummy: tailDummyUUID,
-		Node: rootNodeUUID,
+		Node:      rootNodeUUID,
 		Owner:     userdata.Username,
 		Signature: nil,
 	}
@@ -718,7 +791,6 @@ func (userdata *User) StoreFile(filename string, content []byte) error {
 	}
 
 	// Build FileRoot, Encrypt with Public key. Integrity protected by signature inside UFO
-	fileRootUUID := uuid.New()
 	fileRoot := FileRoot{
 		UFOUUID: ufoUUID,
 		FileKey: K,
@@ -924,9 +996,13 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	recipientUFOUUID := uuid.New()
 
 	// Create root node for recipient (childNode)
+
+	// Create recipients invitation UUID (THEIR file root UUID)
+	invitationUUID := uuid.New() // Also moved here because we need it in NodeUFO
 	childNode := NodeUFO{
 		Username:           recipientUsername,
 		UserFileObjectUUID: recipientUFOUUID,
+		FileRootUUID:       invitationUUID,
 		Children:           []NodeUFO{},
 	}
 
@@ -959,9 +1035,6 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	if err := storeEncryptedAt(ufo.Node, K, nodeUFOBytes); err != nil {
 		return uuid.Nil, errors.New("CreateInvitation: failed to store nodeUFO")
 	}
-
-	// Create recipients invitation UUID (THEIR file root UUID)
-	invitationUUID := uuid.New()
 
 	// Create recipients FileRoot
 	shareRoot := FileRoot{
@@ -1060,6 +1133,92 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 }
 
 func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
+	if len(filename) == 0 {
+		return errors.New("RevokeAccess: empty filename")
+	}
+	if len(recipientUsername) == 0 {
+		return errors.New("RevokeAccess: empty recipient username")
+	}
 
+	// Derive the anchor UUID for this filename in the caller's namespace.
+	anchorUUID, err := fileAnchorUUID(userdata.SK, filename)
+	if err != nil {
+		return err
+	}
+
+	// If the anchor doesn't exist at all, the file does not exist.
+	if _, ok := userlib.DatastoreGet(anchorUUID); !ok {
+		return errors.New("RevokeAccess: file not found")
+	}
+
+	// Load and decrypt the anchor.
+	var anchor DummyPointer
+	if err := loadDecryptedAt(anchorUUID, userdata.SK, &anchor); err != nil {
+		return errors.New("RevokeAccess: corrupted or invalid file anchor")
+	}
+
+	// Load the own FileRoot
+	var root FileRoot
+	if err := loadFileRoot(userdata.PrivateKey, anchor.Address, &root); err != nil {
+		return errors.New("RevokeAccess: failed to load FileRoot")
+	}
+
+	K := root.FileKey
+	ownerUFOUUID := root.UFOUUID
+
+	// Load and verify the UFO.
+	var ufo UserFileObject
+	if err := loadDecryptedAt(ownerUFOUUID, K, &ufo); err != nil {
+		return errors.New("RevokeAccess: failed to load owner UFO")
+	}
+	if err := verifyUFO(&ufo); err != nil {
+		return errors.New("RevokeAccess: UFO integrity check failed")
+	}
+
+	// Only the original owner may revoke.
+	if userdata.Username != ufo.Owner {
+		return errors.New("RevokeAccess: caller is not the owner")
+	}
+
+	// Load the owner's ownership tree root.
+	var ownerRoot NodeUFO
+	if err := loadDecryptedAt(ufo.Node, K, &ownerRoot); err != nil {
+		return errors.New("RevokeAccess: failed to load ownership tree")
+	}
+
+	// Find the direct child we want to revoke.
+	childIdx := -1
+	var childSummary NodeUFO
+	for i, c := range ownerRoot.Children {
+		if c.Username == recipientUsername {
+			childIdx = i
+			childSummary = c
+			break
+		}
+	}
+	if childIdx == -1 {
+		return errors.New("RevokeAccess: target user is not a direct child")
+	}
+
+	if err := tamperSubTree(K, childSummary); err != nil {
+		return err
+	}
+
+	// Remove the direct child from the owner's tree and store it back.
+	ownerRoot.Children = append(ownerRoot.Children[:childIdx], ownerRoot.Children[childIdx+1:]...)
+
+	ownerRootBytes, err := json.Marshal(ownerRoot)
+	if err != nil {
+		return errors.New("RevokeAccess: failed to marshal updated ownership tree")
+	}
+	if err := storeEncryptedAt(ufo.Node, K, ownerRootBytes); err != nil {
+		return errors.New("RevokeAccess: failed to store updated ownership tree")
+	}
+
+	// Now need to Relocate and reencrypt for everyone else.
+
+	// Make More thorough tests
+
+	// BEFORE THAT MUST FIX FILECONTENT NODE. IT NEEDS TO STORE A POINTER TO CONENT, OTHERWISE APPEND WILL LOAD ENTIRE CONTENT AS WE TRAVERSE AND APPEND WILL SCALE TO SIZE OF CONTENT IN FILE.
 	return nil
 }
